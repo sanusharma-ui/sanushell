@@ -9,6 +9,7 @@ from typing import Callable
 
 from ai.actions import AgentAction
 from ai.config import AIConfig
+from core.parser import CommandParser
 
 
 def _extract_json(text: str) -> dict:
@@ -71,6 +72,15 @@ class AgentPlanner:
     command_names: list[str]
     command_catalog: list[str]
     current_dir_provider: Callable[[], Path] | None = None
+    last_output_provider: Callable[[], str] | None = None
+
+    _NO_ARGUMENT_COMMANDS = {
+        "help", "plugins", "exit", "quit", "clear", "cls", "where", "pwd",
+        "up", "home", "processes", "system", "me", "pc", "today",
+        "now", "history", "env", "version", "drives", "ip", "netstat", "path",
+        "memory", "uptime", "vars", "last", "gstatus", "gbranch", "glog",
+        "gdiff", "gpull", "gpush", "gremote", "hello",
+    }
 
     def __post_init__(self) -> None:
         # 1. Memory Setup using env vars or config
@@ -104,7 +114,7 @@ class AgentPlanner:
     def plan(self, user_text: str) -> AgentAction:
         direct = self._fallback_plan(user_text)
         if direct.action != "respond" or direct.message or (self._gemini is None and self._groq is None):
-            return direct
+            return self._remember_action(user_text, self._validate_action(direct))
 
         prompt = self._build_prompt(user_text)
         action = None
@@ -134,23 +144,54 @@ class AgentPlanner:
 
         # If both fail
         if action is None:
-            return AgentAction(
+            return self._remember_action(user_text, AgentAction(
                 action="respond",
                 message=f"I could not reach the AI model right now.\nDetails: {error_msg}",
-            )
+            ))
 
-        # Save to Memory
+        return self._remember_action(user_text, self._validate_action(action))
+
+    def _remember_action(self, user_text: str, action: AgentAction) -> AgentAction:
         self.memory.add("user", user_text)
-        # Save a compressed version of what the bot decided to do
-        ai_response_summary = f"Action: {action.action}, Command: {action.command}, Message: {action.message}"
-        self.memory.add("assistant", ai_response_summary)
-
+        summary = f"Action: {action.action}; Command: {action.command or '(none)'}; Response: {action.message}"
+        self.memory.add("assistant", summary)
         return action
+
+    def _validate_action(self, action: AgentAction) -> AgentAction:
+        """Never let Orbit present conversational text as an executable command."""
+        if action.action != "shell":
+            return action
+
+        command = action.command.strip()
+        try:
+            parts = CommandParser().parse_line(command)
+        except Exception:
+            parts = []
+
+        known_names = {name.lower() for name in self.command_names}
+        is_valid = bool(parts) and all(
+            parsed.name.lower() in known_names
+            and not (parsed.name.lower() in self._NO_ARGUMENT_COMMANDS and parsed.args)
+            for part in parts
+            for parsed in part.pipeline.commands
+        )
+        if is_valid:
+            return action
+
+        return AgentAction(
+            action="respond",
+            message=(
+                action.message
+                if action.message and len(action.message.split()) >= 6
+                else "I could not map that request to a valid RiftShell command. Please clarify the computer action you want me to perform."
+            ),
+        )
 
     def _fallback_plan(self, user_text: str) -> AgentAction:
         text = user_text.strip()
         lowered = text.lower()
-        first_word = lowered.split(maxsplit=1)[0] if lowered else ""
+        words = lowered.split()
+        first_word = words[0] if words else ""
         command_names = {name.lower() for name in self.command_names}
 
         if not text:
@@ -160,37 +201,201 @@ class AgentPlanner:
             )
 
         if self._is_greeting(lowered):
+            if self._gemini is not None or self._groq is not None:
+                return AgentAction(action="respond", message="")
             return AgentAction(
                 action="respond",
-                message="Hello. I am your RiftShell copilot. Ask me a question, or tell me what you want done on the system.",
+                message="Hello. I am Orbit, your RiftShell workspace assistant. How can I help today?",
             )
 
         if self._is_simple_general_question(lowered):
+            if self._gemini is not None or self._groq is not None:
+                return AgentAction(action="respond", message="")
             return AgentAction(action="respond", message=self._answer_simple_general_question(lowered))
 
-        if "screenshot" in lowered or "screen shot" in lowered or ("screen" in lowered and "photo" in lowered):
-            return AgentAction(action="screenshot", message="Taking a screenshot.")
-        if lowered in {"help", "commands", "command list", "show commands", "list commands"}:
-            return AgentAction(action="shell", command="help")
-        if any(phrase in lowered for phrase in ["file dikhao", "files dikhao", "folder dikhao", "list files"]) or lowered in {"ls", "dir", "files"}:
-            return AgentAction(action="shell", command="files")
-        if any(phrase in lowered for phrase in ["kaha ho", "where am i", "current folder"]) or lowered in {"pwd", "where"}:
-            return AgentAction(action="shell", command="where")
-        if re.search(r"\b(process|processes|tasklist|running tasks)\b", lowered):
-            return AgentAction(action="shell", command="processes")
-        if re.search(r"\b(ip|network config|ipconfig)\b", lowered):
-            return AgentAction(action="shell", command="ip")
-        if lowered in {"time", "current time", "what time is it", "show time"}:
-            return AgentAction(action="shell", command="now")
-        if lowered in {"date", "today", "current date", "show date"}:
-            return AgentAction(action="shell", command="today")
+        if self._asks_where_output_is(lowered):
+            return AgentAction(
+                action="respond",
+                message=(
+                    "Command output appears in the active terminal panel. I also post a completion note here in Orbit. "
+                    "If you want, ask me to explain or summarize the latest terminal output."
+                ),
+            )
 
-        if first_word in command_names and not self._looks_like_chat(lowered):
-            return AgentAction(action="shell", command=text)
+        local_action = self._route_workspace_request(text, lowered)
+        if local_action is not None:
+            return local_action
+
+        if lowered.startswith("/cmd "):
+            return AgentAction(action="shell", command=text[5:].strip(), message="I will run the requested RiftShell command after your approval.")
+
+        if len(words) == 1 and first_word in command_names:
+            return AgentAction(action="shell", command=text, message="I will run that RiftShell command after your approval.")
 
         if self._gemini is None and self._groq is None:
             return self._offline_response(text)
         return AgentAction(action="respond", message="")
+
+    @staticmethod
+    def _shell(command: str, message: str) -> AgentAction:
+        return AgentAction(action="shell", command=command, message=message)
+
+    def _route_workspace_request(self, text: str, lowered: str) -> AgentAction | None:
+        """Fast, offline routing for the common English ways people describe shell work."""
+        normalized = re.sub(r"\s+", " ", lowered).strip(" .?!")
+
+        if "screenshot" in normalized or "screen shot" in normalized or ("screen" in normalized and "photo" in normalized):
+            return AgentAction(action="screenshot", message="I will capture a screenshot.")
+
+        if match := re.match(r"(?:please\s+)?(?:execute|run)\s+(?:the\s+)?(.+?)(?:\s+command)?$", text, flags=re.IGNORECASE):
+            requested = match.group(1).strip()
+            routed = self._route_workspace_request(requested, requested.lower())
+            if routed is not None:
+                return routed
+            if requested.split(maxsplit=1)[0].lower() in {name.lower() for name in self.command_names}:
+                return self._shell(requested, "I will run the requested RiftShell command.")
+
+        if normalized in {"help", "commands", "command list", "show commands", "list commands"}:
+            return self._shell("help", "I will show the available RiftShell commands.")
+
+        if normalized in {"where", "pwd", "where am i", "where we are", "where are we", "current directory", "current folder", "working directory", "show current directory", "show current folder", "what folder am i in", "what directory am i in", "show my location"}:
+            return self._shell("where", "I will show the current workspace directory.")
+        if re.fullmatch(r"(?:show|display)(?:\s+me)?\s+(?:the\s+)?(?:current|working)\s+(?:directory|folder)", normalized):
+            return self._shell("where", "I will show the current workspace directory.")
+
+        if normalized in {"ls", "dir", "files", "list files", "show files", "display files", "show me the files", "list the files", "what files are here", "what is in this folder", "what's in this folder", "show folder contents", "list folder contents"}:
+            return self._shell("files", "I will list the files and folders in the current directory.")
+
+        if normalized in {"folders", "list folders", "show folders", "show directories", "list directories", "only folders"}:
+            return self._shell("folders", "I will list the folders in the current directory.")
+
+        if normalized in {"up", "go up", "go back", "parent folder", "go to parent folder"}:
+            return self._shell("up", "I will move to the parent directory.")
+        if normalized in {"home", "go home", "go to home folder", "go to my home folder"}:
+            return self._shell("home", "I will open your home directory in this session.")
+
+        if match := re.match(r"(?:go to|change to|switch to|open directory|navigate to)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"cd {match.group(1).strip()}", "I will change this session to the requested directory.")
+
+        if match := re.match(r"(?:create|make|new)\s+(?:a\s+)?(?:folder|directory)\s+(?:named\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"makefolder {match.group(1).strip()}", "I will create the requested folder.")
+        if match := re.match(r"(?:create|make|new)\s+(?:an?\s+)?file\s+(?:named\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"makefile {match.group(1).strip()}", "I will create the requested file.")
+
+        if match := re.match(r"(?:show|list|display)\s+(?:all\s+)?(.+?)\s+files?$", text, flags=re.IGNORECASE):
+            kind = match.group(1).strip().lower()
+            extensions = {
+                "python": "py", "py": "py", "javascript": "js", "typescript": "ts",
+                "json": "json", "markdown": "md", "text": "txt", "image": "png",
+            }
+            if extension := extensions.get(kind):
+                return self._shell(f"files | filter {extension}", f"I will show the {kind} files in the current directory.")
+
+        if match := re.match(r"(?:find|search)\s+(?:text\s+)?['\"](.+?)['\"]\s+(?:in|inside)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"findtext {match.group(1).strip()} {match.group(2).strip()}", "I will search that file for the requested text.")
+
+        if match := re.match(r"(?:open|launch)\s+(?:the\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"open {match.group(1).strip()}", "I will open the requested file or folder.")
+
+        if match := re.match(r"(?:show|read|display)\s+(?:the\s+)?first\s+(\d+)\s+lines?\s+(?:of|from)\s+(?:the\s+)?(?:file\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"head {match.group(2).strip()} {match.group(1)}", "I will show the requested first lines of the file.")
+        if match := re.match(r"(?:show|read|display)\s+(?:the\s+)?last\s+(\d+)\s+lines?\s+(?:of|from)\s+(?:the\s+)?(?:file\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"tail {match.group(2).strip()} {match.group(1)}", "I will show the requested last lines of the file.")
+        if match := re.match(r"(?:count|show)\s+(?:the\s+)?(?:lines|words|characters|stats)\s+(?:in|of)\s+(?:the\s+)?(?:file\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"wc {match.group(1).strip()}", "I will count the file's lines, words, and characters.")
+
+        if match := re.match(r"read\s+(?:the\s+)?(?:contents?\s+of\s+)?(?:file\s+)?(.+)$", text, flags=re.IGNORECASE):
+            target = match.group(1).strip()
+            incomplete_targets = {"files", "folders", "directory", "current directory", "current folder", "first lines", "last lines"}
+            if re.fullmatch(r"(?:the\s+)?(?:first|last)\s+\d+\s+lines?", target, flags=re.IGNORECASE):
+                return AgentAction(action="respond", message="Please tell me which file you would like me to inspect.")
+            if target and target.lower() not in incomplete_targets:
+                return self._shell(f"read {target}", "I will read the requested file.")
+
+        if match := re.match(r"(?:show|display)\s+(?:the\s+)?(?:contents?\s+of|file)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"read {match.group(1).strip()}", "I will read the requested file.")
+
+        if match := re.match(r"(?:find|locate|where is)\s+(?:the\s+)?(?:command|executable|program)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"which {match.group(1).strip()}", "I will locate the requested executable.")
+
+        if match := re.match(r"(?:find|search for|look for)\s+(?:a\s+)?(?:file|folder|directory)?\s*['\"]?(.+?)['\"]?$", text, flags=re.IGNORECASE):
+            query = match.group(1).strip()
+            if query:
+                return self._shell(f"search {query}", "I will search for matching files and folders.")
+
+        if match := re.match(r"(?:copy|duplicate)\s+(.+?)\s+(?:to|into)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"duplicate {match.group(1).strip()} {match.group(2).strip()}", "I will copy the requested item after your approval.")
+        if match := re.match(r"(?:move|shift)\s+(.+?)\s+(?:to|into)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"shift {match.group(1).strip()} {match.group(2).strip()}", "I will move the requested item after your approval.")
+        if match := re.match(r"(?:rename)\s+(.+?)\s+(?:to|as)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"rename {match.group(1).strip()} {match.group(2).strip()}", "I will rename the requested item after your approval.")
+        if match := re.match(r"(?:delete|remove)\s+(?:the\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"delete confirm {match.group(1).strip()}", "I will delete the requested item only after your approval and the built-in safety confirmation.")
+
+        if normalized in {"processes", "show processes", "list processes", "running processes", "running tasks", "tasklist", "what is running"}:
+            return self._shell("processes", "I will show the running processes.")
+        if normalized in {"system", "system info", "system information", "computer info", "show system info"}:
+            return self._shell("system", "I will show the system information.")
+        if normalized in {"network", "network info", "network information", "show network info"}:
+            return self._shell("network", "I will show the network information.")
+        if normalized in {"ip", "ipconfig", "ip address", "show ip", "network config", "network configuration"}:
+            return self._shell("ip", "I will show the IP configuration.")
+        if normalized in {"connections", "network connections", "netstat", "active connections"}:
+            return self._shell("netstat", "I will show the active network connections.")
+        if normalized in {"memory", "ram", "ram usage", "memory usage"}:
+            return self._shell("memory", "I will show current memory usage.")
+        if normalized in {"uptime", "system uptime", "how long has the computer been on"}:
+            return self._shell("uptime", "I will show the system uptime.")
+        if normalized in {"drives", "show drives", "list drives"}:
+            return self._shell("drives", "I will show the available drives.")
+        if normalized in {"disk", "disk space", "disk usage", "show disk space", "show disk usage"}:
+            return self._shell("disk", "I will show the available disk space for the current directory.")
+        if normalized in {"path", "show path", "environment path"}:
+            return self._shell("path", "I will show the active PATH value.")
+        if normalized in {"environment", "environment variables", "show environment variables"}:
+            return self._shell("env", "I will show the environment variables.")
+        if normalized in {"history", "command history", "show history"}:
+            return self._shell("history", "I will show this terminal session's command history.")
+        if normalized in {"time", "current time", "what time is it", "show time"}:
+            return self._shell("now", "I will show the current time.")
+        if normalized in {"date", "today", "current date", "show date"}:
+            return self._shell("today", "I will show today's date.")
+        if normalized in {"who am i", "current user", "show current user", "my username"}:
+            return self._shell("me", "I will show the signed-in user.")
+        if normalized in {"computer name", "pc name", "machine name", "show pc name"}:
+            return self._shell("pc", "I will show the computer name.")
+        if normalized in {"version", "shell version", "riftshell version"}:
+            return self._shell("version", "I will show the RiftShell version.")
+        if normalized in {"plugins", "show plugins", "list plugins", "plugin status"}:
+            return self._shell("plugins", "I will show the installed plugin status.")
+
+        if match := re.match(r"(?:calculate|calc|what is)\s+([\d\s+*/().%-]+)$", normalized):
+            return self._shell(f"calc {match.group(1).strip()}", "I will calculate that expression.")
+        if match := re.match(r"(?:ping)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"ping {match.group(1).strip()}", "I will ping the requested host.")
+        if match := re.match(r"(?:hash|checksum)\s+(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"hash {match.group(1).strip()}", "I will generate a hash for the requested text or file.")
+        if match := re.match(r"(?:download)\s+(https?://\S+)(?:\s+(?:as|to)\s+(.+))?$", text, flags=re.IGNORECASE):
+            filename = f" {match.group(2).strip()}" if match.group(2) else ""
+            return self._shell(f"download {match.group(1)}{filename}", "I will download the requested file after your approval.")
+        if match := re.match(r"(?:show|display)\s+(?:a\s+)?tree(?:\s+of)?\s*(.*)$", text, flags=re.IGNORECASE):
+            suffix = match.group(1).strip()
+            return self._shell(f"tree {suffix}".strip(), "I will show the directory tree.")
+        if match := re.match(r"(?:switch|change|set)\s+(?:the\s+)?theme\s+(?:to\s+)?(.+)$", text, flags=re.IGNORECASE):
+            return self._shell(f"theme {match.group(1).strip()}", "I will switch the workspace theme.")
+
+        git_routes = {
+            "git status": ("gstatus", "I will show the Git working tree status."),
+            "git branches": ("gbranch", "I will show the Git branches."),
+            "git log": ("glog", "I will show the recent Git commit history."),
+            "git diff": ("gdiff", "I will show the unstaged Git changes."),
+            "git remotes": ("gremote", "I will show the configured Git remotes."),
+        }
+        if normalized in git_routes:
+            command, message = git_routes[normalized]
+            return self._shell(command, message)
+
+        return None
 
     def _is_greeting(self, lowered: str) -> bool:
         cleaned = re.sub(r"[^a-z0-9\s]", "", lowered).strip()
@@ -232,6 +437,14 @@ class AgentPlanner:
         )
         return lowered.startswith(chat_starters)
 
+    @staticmethod
+    def _asks_where_output_is(lowered: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9\s]", "", lowered)
+        return bool(
+            re.search(r"\bwhere\s+(?:is|did)\s+(?:the\s+)?(?:output|result|response)\b", normalized)
+            or re.search(r"\b(?:show|see|find)\s+(?:the\s+)?(?:output|result)\b", normalized)
+        )
+
     def _is_simple_general_question(self, lowered: str) -> bool:
         return bool(
             re.search(r"\bhow\s+many\s+continents\b", lowered)
@@ -247,9 +460,9 @@ class AgentPlanner:
         return AgentAction(
             action="respond",
             message=(
-                "I can handle basic conversation and direct RiftShell commands locally. "
-                "For broader AI answers, configure a Gemini or Groq API key. "
-                "To run a command directly, send something like `files`, `where`, `ip`, or `/cmd files`."
+                "I can help with the built-in RiftShell workspace requests locally. "
+                "For broader reasoning and more complex phrasing, configure a Gemini or Groq API key. "
+                "You can also use the Command Explorer to browse every available command."
             ),
         )
 
@@ -257,10 +470,15 @@ class AgentPlanner:
         catalog = "\n".join(f"- {item}" for item in self.command_catalog)
         history = self.memory.format_for_prompt()
         current_dir = self.current_dir_provider() if self.current_dir_provider else self.config.workspace_root
+        asks_about_terminal_output = bool(
+            re.search(r"\b(?:output|result|terminal|previous command|last command)\b", user_text, flags=re.IGNORECASE)
+        )
+        last_output = self.last_output_provider() if self.last_output_provider and asks_about_terminal_output else ""
+        last_output = last_output[-3000:] if last_output else "(not included for this request)"
         access_mode = "FULL_PC" if self.config.allow_outside_workspace else "WORKSPACE_ONLY"
 
         return f"""
-You are RiftShell Copilot: a friendly, practical AI assistant inside a Telegram-controlled Python shell.
+You are Orbit: a friendly, professional workspace assistant inside RiftShell.
 You can chat naturally, answer general questions, clarify intent, and execute safe shell actions when the user clearly wants computer work.
 Your output must always be STRICT, VALID JSON.
 
@@ -274,10 +492,13 @@ Runtime context:
 - Current directory: {current_dir}
 - AI workspace root: {self.config.workspace_root}
 - Access mode: {access_mode}
+- Interface: Orbit is a chat panel beside the active terminal. Shell command output is rendered in that terminal, not inside the chat panel.
+- Latest terminal output (may be truncated):
+{last_output}
 
 UNIVERSAL RULES (READ AND OBEY):
-1. GENERAL CHAT IS ALLOWED: If the user greets you, asks a general knowledge question, asks for advice, or is just talking, return {{"action":"respond","message":"..."}} with a warm concise answer. Do not force a shell command.
-2. COMMAND INTENT: Use "shell" only when the user clearly asks to inspect or change the computer, run a listed command, navigate files, show system info, capture screenshot, or execute a specific task.
+1. ASSISTANT FIRST: Your primary role is a capable conversational assistant. General knowledge, explanations, planning, brainstorming, recommendations, coding guidance, follow-up questions, and casual conversation must return {{"action":"respond","message":"..."}}.
+2. COMMAND INTENT: Use "shell" only when the user clearly asks to inspect or change the computer/workspace, run a listed command, navigate files, show system info, capture a screenshot, or execute a specific machine task. A word that happens to match a command name is not enough.
 3. READ THE CATALOG: Never guess command syntax. Look at the "Available Commands" catalog below. Format shell commands EXACTLY as the catalog requires.
 4. UNKNOWN COMMANDS: If the user asks for something that is not supported by the catalog, respond conversationally and explain what you can do instead. Never say "No such commands" for general chat.
 5. LOCATION: Relative paths run from the Current directory above. Use `cd <path>` when the user asks to move to a location. Use absolute paths only when the user gives or clearly asks for one.
@@ -287,13 +508,20 @@ UNIVERSAL RULES (READ AND OBEY):
 9. NO CHAT IN COMMAND: The "command" field MUST ONLY contain executable RiftShell syntax. Put explanation in "message".
 10. PIPING: You can use `|` if the catalog supports it.
 11. CODE WRITES: Use "code_write" only when the user explicitly asks you to create or rewrite files with code/content. Keep file paths exact and content complete.
-12. TONE: Use clear, professional English. Be helpful like a copilot, but do not pretend a command ran unless the action is "shell", "screenshot", or "code_write".
+12. TONE: Use clear, friendly, professional English. Keep explanations concise and specific. Do not pretend a command ran unless the action is "shell", "screenshot", or "code_write".
+13. TRANSLATION: Convert natural-language requests into the closest valid command from the catalog. Never place the user's natural-language sentence in the "command" field unless it is already valid RiftShell syntax.
+14. CONTEXT: Understand follow-ups using Recent Conversation History and Latest terminal output. If the user asks where command output is, explain that it appears in the active terminal; do not run `last` unless they explicitly ask to print the previous output again.
+15. COLLISIONS: Words such as "now", "last", "path", "where", "history", and "help" may occur in ordinary conversation. Only treat them as commands when the overall sentence clearly requests a computer action.
+16. PLANNING: When asked to make a plan, think through a problem, compare options, or provide advice, respond with a useful plan in natural language. Do not turn planning into shell commands unless the user explicitly asks you to inspect or modify the workspace.
 
 Routing examples:
 - User: "hello" -> {{"action":"respond","message":"Hello. How can I help?"}}
 - User: "How many continents are there?" -> {{"action":"respond","message":"There are 7 continents: Asia, Africa, North America, South America, Antarctica, Europe, and Australia/Oceania."}}
 - User: "list files" -> {{"action":"shell","command":"files","message":"Listing files."}}
 - User: "show my current folder" -> {{"action":"shell","command":"where","message":"Showing the current folder."}}
+- User: "now tell me who Elon Musk is" -> {{"action":"respond","message":"Elon Musk is a technology entrepreneur..."}}
+- User: "help me plan a Python project" -> {{"action":"respond","message":"Here is a practical project plan..."}}
+- User: "where is the output?" -> {{"action":"respond","message":"The command output appears in the active terminal panel."}}
 - User: "take a screenshot" -> {{"action":"screenshot","message":"Taking a screenshot."}}
 - User: "write a Python script at hello.py that prints hello" -> {{"action":"code_write","message":"Preparing hello.py.","files":[{{"path":"hello.py","content":"print('hello')\n"}}]}}
 
@@ -302,6 +530,8 @@ Available Commands & Aliases:
 
 Recent Conversation History:
 {history}
+
+History note: workspace action records describe what happened earlier; they are context, not examples of how the current request must be routed. Re-evaluate the current user's intent independently.
 
 User request:
 {user_text}

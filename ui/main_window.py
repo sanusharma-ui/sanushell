@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.shell import Shell
+from ai.safety import SafetyPolicy
 from ui.themes import build_stylesheet, get_theme, list_themes
 
 
@@ -120,6 +121,7 @@ class OrbitWorker(QThread):
                 command_names=self.shell.registry.all_names(),
                 command_catalog=self.shell.registry.catalog_entries(),
                 current_dir_provider=lambda: self.shell.ctx.cwd,
+                last_output_provider=lambda: self.shell.ctx.last_output,
             )
             self.planned.emit(planner.plan(self.prompt))
         except Exception as exc:
@@ -147,7 +149,7 @@ class CommandPalette(QDialog):
         self._entries: list[tuple[str, str, str]] = [
             ("action", "New terminal session", "Create a workspace session"),
             ("action", "Open settings", "Theme, font and safety preferences"),
-            ("action", "Toggle Orbit", "Show or hide the AI planning panel"),
+            ("action", "Toggle Orbit", "Show or hide the smart assistant panel"),
             ("action", "Show plugins", "Inspect loaded plugin status"),
         ]
         self._entries.extend(("command", meta.name, f"{meta.usage} — {meta.description}") for meta in shell.registry.list_metadata())
@@ -232,11 +234,13 @@ class TerminalSession(QWidget):
     session_changed = Signal()
     history_added = Signal(str)
     close_requested = Signal(object)
+    command_completed = Signal(str, object)
 
     def __init__(self, shell: Shell, title: str, preferences: dict, parent=None):
         super().__init__(parent)
         self.shell, self.title, self.preferences = shell, title, preferences
         self.worker: CommandWorker | None = None
+        self.active_command = ""
         self.name_label = QLabel(title)
         self.name_label.setFont(QFont(preferences["font_family"], 11, QFont.Bold))
         self.path_label = QLabel(str(shell.ctx.cwd))
@@ -339,11 +343,11 @@ class TerminalSession(QWidget):
     def run_command(self):
         command = self.input.text().strip()
         if not command or self.is_busy:
-            return
+            return False
         if command.lower() in {"clear", "cls"}:
             self.clear_console()
             self.input.clear()
-            return
+            return True
         if self._needs_confirmation(command):
             dialog = QMessageBox(self)
             dialog.setIcon(QMessageBox.Warning)
@@ -354,13 +358,15 @@ class TerminalSession(QWidget):
             dialog.setDefaultButton(QMessageBox.Cancel)
             if dialog.exec() != QMessageBox.Yes:
                 self.append_system("Command cancelled before execution.")
-                return
+                return False
         self.append_html(f"{self.shell.prompt()}{command}", self._theme().accent_alt, "$")
+        self.active_command = command
         self._set_running(True)
         self.worker = CommandWorker(self.shell, command, self)
         self.worker.result_ready.connect(self._on_finished)
         self.worker.finished.connect(self._worker_finished)
         self.worker.start()
+        return True
 
     def request_cancel(self):
         if self.worker:
@@ -384,6 +390,8 @@ class TerminalSession(QWidget):
         self.input.clear()
         self.input.setFocus()
         self.session_changed.emit()
+        self.command_completed.emit(self.active_command, result)
+        self.active_command = ""
         if result.exit_shell:
             self.close_requested.emit(self)
 
@@ -409,6 +417,7 @@ class OrbitPanel(QFrame):
         super().__init__(parent)
         self.setObjectName("inspector")
         self.session_provider = session_provider
+        self.safety = SafetyPolicy()
         self.worker: OrbitWorker | None = None
         self.pending_command = ""
         heading = QLabel("ORBIT")
@@ -423,14 +432,14 @@ class OrbitPanel(QFrame):
         self.stream_text = ""
         self.stream_index = 0
         self.stream_done = None
-        self.status = QLabel("Plan first. You stay in control.")
+        self.status = QLabel("Ask anything, or request a workspace action.")
         self.status.setWordWrap(True)
         self.conversation = QTextEdit()
         self.conversation.setReadOnly(True)
         self.conversation.setMinimumHeight(200)
         self.input = QLineEdit()
         self.input.setPlaceholderText("Ask: ‘show Python files’")
-        self.plan_button = QPushButton("Create plan")
+        self.plan_button = QPushButton("Ask Orbit")
         self.plan_button.setObjectName("primaryButton")
         self.approve_button = QPushButton("Approve & run")
         self.approve_button.setEnabled(False)
@@ -480,7 +489,9 @@ class OrbitPanel(QFrame):
             return
         self._append("You", prompt)
         self.input.clear()
-        self.status.setText("Planning with your current workspace context…")
+        self.status.setText("Thinking with conversation and workspace context…")
+        self.approve_button.setEnabled(False)
+        self.reject_button.setEnabled(False)
         self._set_thinking(True)
         self.worker = OrbitWorker(session.shell, prompt, self)
         self.worker.planned.connect(self._show_plan)
@@ -490,15 +501,27 @@ class OrbitPanel(QFrame):
 
     def _show_plan(self, action):
         self.pending_command = ""
-        message = action.message or "No additional explanation."
+        self.approve_button.setEnabled(False)
+        self.reject_button.setEnabled(False)
+        message = action.message or (
+            "I prepared the following RiftShell command for your review."
+            if action.action == "shell"
+            else "Here is the result of my workspace analysis."
+        )
         if action.action == "shell" and action.command:
-            self.pending_command = action.command
-            self._stream("Plan", f"{message}\n\nProposed command:\n{action.command}")
-            self.status.setText("Review the proposed command before approving it.")
-            self.approve_button.setEnabled(True)
-            self.reject_button.setEnabled(True)
+            decision = self.safety.check_action(action.action, action.command)
+            if decision.requires_approval:
+                self.pending_command = action.command
+                self._stream("Orbit", f"{message}\n\nProposed command:\n{action.command}\n\nApproval is required because {decision.reason}")
+                self.status.setText("Review the proposed command before approving it.")
+                self.approve_button.setEnabled(True)
+                self.reject_button.setEnabled(True)
+            else:
+                self._stream("Orbit", f"{message}\n\nRunning in the active terminal:\n{action.command}")
+                self.status.setText("Executing in the active terminal. Output will appear there shortly.")
+                self.command_requested.emit(action.command)
         elif action.action == "code_write":
-            self._stream("Plan", f"{message}\n\nThis plan writes {len(action.files)} file(s). Use the existing Telegram approval flow to apply code-write actions.")
+            self._stream("Orbit", f"{message}\n\nThis plan writes {len(action.files)} file(s). Use the existing Telegram approval flow to apply code-write actions.")
             self.status.setText("Code-write plans are intentionally approval-only here.")
         else:
             self._stream("Orbit", message)
@@ -545,14 +568,26 @@ class OrbitPanel(QFrame):
     def approve(self):
         if self.pending_command:
             self.command_requested.emit(self.pending_command)
-            self._append("System", "Approved. Sending command to the active terminal.")
-        self.dismiss()
+            self._append("Orbit", "Approved. Executing in the active terminal; the output will appear there.")
+            self.status.setText("Executing approved command in the active terminal.")
+        self.pending_command = ""
+        self.approve_button.setEnabled(False)
+        self.reject_button.setEnabled(False)
 
     def dismiss(self):
         self.pending_command = ""
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
-        self.status.setText("Plan first. You stay in control.")
+        self.status.setText("Ask anything, or request a workspace action.")
+
+    def show_execution_result(self, command: str, result):
+        if result.success:
+            self._stream("Orbit", f"Completed: {command}\nThe command output is now available in the active terminal.")
+            self.status.setText("Completed. Review the terminal output for the full result.")
+            return
+        detail = result.output.strip().splitlines()[0] if result.output else "The command did not complete successfully."
+        self._stream("Orbit", f"The command did not complete: {command}\n{detail}\n\nSee the terminal for full details.")
+        self.status.setText("Command failed. Full diagnostics are in the terminal.")
 
 
 class MainWindow(QMainWindow):
@@ -562,6 +597,7 @@ class MainWindow(QMainWindow):
         self.preferences = self._load_preferences()
         self.theme = get_theme(self.preferences["theme"])
         self.history = self._load_history() if self.preferences["restore_history"] else []
+        self._orbit_execution: tuple[TerminalSession, str] | None = None
         self.setWindowTitle("RiftShell — Developer Workspace")
         self.resize(1440, 880)
         self.setMinimumSize(1080, 680)
@@ -675,6 +711,7 @@ class MainWindow(QMainWindow):
         session.history_added.connect(self.record_history)
         session.session_changed.connect(self._refresh_workspace)
         session.close_requested.connect(self.close_session)
+        session.command_completed.connect(lambda command, result, source=session: self._on_terminal_command_complete(source, command, result))
         self.tabs.setCurrentIndex(self.tabs.addTab(session, session.title))
         self._refresh_workspace()
         session.input.setFocus()
@@ -899,8 +936,20 @@ class MainWindow(QMainWindow):
 
     def _run_orbit_command(self, command: str):
         if session := self.current_session():
+            if session.is_busy:
+                self.orbit._append("Orbit", "The active terminal is busy. Wait for the current command to finish, then try again.")
+                self.orbit.status.setText("Waiting for the active terminal to become available.")
+                return
+            self._orbit_execution = (session, command)
             session.input.setText(command)
-            session.run_command()
+            if not session.run_command():
+                self._orbit_execution = None
+
+    def _on_terminal_command_complete(self, session: TerminalSession, command: str, result):
+        if self._orbit_execution != (session, command):
+            return
+        self._orbit_execution = None
+        self.orbit.show_execution_result(command, result)
 
     def closeEvent(self, event):
         for index in range(self.tabs.count()):
