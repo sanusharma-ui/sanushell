@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QThread, Signal, QStringListModel
+from PySide6.QtCore import Qt, QSettings, QThread, Signal, QStringListModel, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox,
@@ -100,7 +100,7 @@ class CommandWorker(QThread):
             self.result_ready.emit(self.shell.execute_line(self.command))
 
 
-class CopilotWorker(QThread):
+class OrbitWorker(QThread):
     planned = Signal(object)
     failed = Signal(str)
 
@@ -147,7 +147,7 @@ class CommandPalette(QDialog):
         self._entries: list[tuple[str, str, str]] = [
             ("action", "New terminal session", "Create a workspace session"),
             ("action", "Open settings", "Theme, font and safety preferences"),
-            ("action", "Toggle Copilot", "Show or hide the AI planning panel"),
+            ("action", "Toggle Orbit", "Show or hide the AI planning panel"),
             ("action", "Show plugins", "Inspect loaded plugin status"),
         ]
         self._entries.extend(("command", meta.name, f"{meta.usage} — {meta.description}") for meta in shell.registry.list_metadata())
@@ -402,17 +402,27 @@ class TerminalSession(QWidget):
         return False
 
 
-class CopilotPanel(QFrame):
+class OrbitPanel(QFrame):
     command_requested = Signal(str)
 
     def __init__(self, session_provider, parent=None):
         super().__init__(parent)
         self.setObjectName("inspector")
         self.session_provider = session_provider
-        self.worker: CopilotWorker | None = None
+        self.worker: OrbitWorker | None = None
         self.pending_command = ""
-        heading = QLabel("COPILOT")
+        heading = QLabel("ORBIT")
         heading.setObjectName("sectionTitle")
+        self.thinking_indicator = QLabel("")
+        self.thinking_indicator.setObjectName("statusPill")
+        self.thinking_timer = QTimer(self)
+        self.thinking_timer.timeout.connect(self._advance_thinking_indicator)
+        self.thinking_frame = 0
+        self.stream_timer = QTimer(self)
+        self.stream_timer.timeout.connect(self._stream_next_chunk)
+        self.stream_text = ""
+        self.stream_index = 0
+        self.stream_done = None
         self.status = QLabel("Plan first. You stay in control.")
         self.status.setWordWrap(True)
         self.conversation = QTextEdit()
@@ -432,7 +442,11 @@ class CopilotPanel(QFrame):
         actions.addWidget(self.reject_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
-        layout.addWidget(heading)
+        header = QHBoxLayout()
+        header.addWidget(heading)
+        header.addStretch()
+        header.addWidget(self.thinking_indicator)
+        layout.addLayout(header)
         layout.addWidget(self.status)
         layout.addWidget(self.conversation, 1)
         layout.addWidget(self.input)
@@ -442,6 +456,24 @@ class CopilotPanel(QFrame):
         self.approve_button.clicked.connect(self.approve)
         self.reject_button.clicked.connect(self.dismiss)
 
+    def _set_thinking(self, thinking: bool):
+        if thinking:
+            self.thinking_frame = 0
+            self.thinking_indicator.setText("THINKING  |")
+            self.thinking_timer.start(110)
+            self.input.setEnabled(False)
+            self.plan_button.setEnabled(False)
+            return
+        self.thinking_timer.stop()
+        self.thinking_indicator.setText("")
+        self.input.setEnabled(True)
+        self.plan_button.setEnabled(True)
+
+    def _advance_thinking_indicator(self):
+        frames = ("|", "/", "-", "\\")
+        self.thinking_indicator.setText(f"THINKING  {frames[self.thinking_frame % len(frames)]}")
+        self.thinking_frame += 1
+
     def create_plan(self):
         prompt, session = self.input.text().strip(), self.session_provider()
         if not prompt or session is None or self.worker and self.worker.isRunning():
@@ -449,11 +481,11 @@ class CopilotPanel(QFrame):
         self._append("You", prompt)
         self.input.clear()
         self.status.setText("Planning with your current workspace context…")
-        self.plan_button.setEnabled(False)
-        self.worker = CopilotWorker(session.shell, prompt, self)
+        self._set_thinking(True)
+        self.worker = OrbitWorker(session.shell, prompt, self)
         self.worker.planned.connect(self._show_plan)
         self.worker.failed.connect(self._show_failure)
-        self.worker.finished.connect(lambda: self.plan_button.setEnabled(True))
+        self.worker.finished.connect(lambda: self._set_thinking(False))
         self.worker.start()
 
     def _show_plan(self, action):
@@ -461,23 +493,54 @@ class CopilotPanel(QFrame):
         message = action.message or "No additional explanation."
         if action.action == "shell" and action.command:
             self.pending_command = action.command
-            self._append("Plan", f"{message}\n\nProposed command:\n{action.command}")
+            self._stream("Plan", f"{message}\n\nProposed command:\n{action.command}")
             self.status.setText("Review the proposed command before approving it.")
             self.approve_button.setEnabled(True)
             self.reject_button.setEnabled(True)
         elif action.action == "code_write":
-            self._append("Plan", f"{message}\n\nThis plan writes {len(action.files)} file(s). Use the existing Telegram approval flow to apply code-write actions.")
+            self._stream("Plan", f"{message}\n\nThis plan writes {len(action.files)} file(s). Use the existing Telegram approval flow to apply code-write actions.")
             self.status.setText("Code-write plans are intentionally approval-only here.")
         else:
-            self._append("Copilot", message)
+            self._stream("Orbit", message)
             self.status.setText("No command will run for this response.")
 
     def _show_failure(self, error: str):
-        self._append("Copilot", f"Planning failed: {error}")
+        self._append("Orbit", f"Planning failed: {error}")
         self.status.setText("Could not reach the configured AI provider.")
 
     def _append(self, label: str, text: str):
         self.conversation.append(f"<b>{escape(label)}</b><br>{escape(text).replace(chr(10), '<br>')}<br>")
+
+    def _stream(self, label: str, text: str, on_done=None):
+        """Reveal a completed plan smoothly instead of dropping a text wall at once."""
+        if self.stream_timer.isActive():
+            self.stream_timer.stop()
+        self.stream_text = text
+        self.stream_index = 0
+        self.stream_done = on_done
+        cursor = self.conversation.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml(f"<b>{escape(label)}</b><br>")
+        self.conversation.setTextCursor(cursor)
+        self.stream_timer.start(9)
+
+    def _stream_next_chunk(self):
+        if self.stream_index >= len(self.stream_text):
+            self.stream_timer.stop()
+            cursor = self.conversation.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText("\n\n")
+            self.conversation.setTextCursor(cursor)
+            if self.stream_done:
+                self.stream_done()
+            return
+        chunk = self.stream_text[self.stream_index:self.stream_index + 4]
+        cursor = self.conversation.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(chunk)
+        self.conversation.setTextCursor(cursor)
+        self.conversation.ensureCursorVisible()
+        self.stream_index += len(chunk)
 
     def approve(self):
         if self.pending_command:
@@ -533,9 +596,9 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._refresh_workspace)
         self.tabs.tabCloseRequested.connect(self.close_session_at)
         root.addWidget(self.tabs)
-        self.copilot = CopilotPanel(self.current_session)
-        self.copilot.command_requested.connect(self._run_copilot_command)
-        root.addWidget(self.copilot)
+        self.orbit = OrbitPanel(self.current_session)
+        self.orbit.command_requested.connect(self._run_orbit_command)
+        root.addWidget(self.orbit)
         root.setSizes([250, 900, 300])
         self.root_splitter = root
         self.status_label = QLabel()
@@ -695,7 +758,7 @@ class MainWindow(QMainWindow):
     def _handle_palette_action(self, action: str):
         callbacks = {
             "New terminal session": self.new_session, "Open settings": self.open_settings,
-            "Toggle Copilot": self.toggle_copilot, "Show plugins": self.show_plugins,
+            "Toggle Orbit": self.toggle_orbit, "Show plugins": self.show_plugins,
         }
         if callback := callbacks.get(action):
             callback()
@@ -831,10 +894,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(text, 1)
         dialog.exec()
 
-    def toggle_copilot(self):
-        self.copilot.setVisible(not self.copilot.isVisible())
+    def toggle_orbit(self):
+        self.orbit.setVisible(not self.orbit.isVisible())
 
-    def _run_copilot_command(self, command: str):
+    def _run_orbit_command(self, command: str):
         if session := self.current_session():
             session.input.setText(command)
             session.run_command()
