@@ -32,6 +32,13 @@ class Shell:
     def prompt(self) -> str:
         return f"RiftShell {self.ctx.cwd}> "
 
+    def request_cancel(self) -> None:
+        """Signal cooperative commands (such as native processes) to stop."""
+        self.ctx.cancel_event.set()
+
+    def clear_cancel(self) -> None:
+        self.ctx.cancel_event.clear()
+
     def execute_line(self, raw: str) -> CommandResult:
         raw = raw.strip()
         if not raw:
@@ -47,6 +54,8 @@ class Shell:
         last_result = CommandResult(output="")
 
         for part in parts:
+            if self.ctx.cancel_event.is_set():
+                return CommandResult(output="Command cancelled.", success=False)
             if part.operator == "&&" and not last_result.success:
                 continue
             if part.operator == "||" and last_result.success:
@@ -72,6 +81,8 @@ class Shell:
         result = CommandResult(output="")
 
         for index, parsed in enumerate(commands):
+            if self.ctx.cancel_event.is_set():
+                return CommandResult(output="Command cancelled.", success=False)
             self.ctx.piped_input = previous_output if index > 0 else ""
             result = self._execute_command(parsed)
             previous_output = result.output
@@ -82,6 +93,8 @@ class Shell:
         return result
 
     def _execute_command(self, parsed: ParsedCommand) -> CommandResult:
+        if self.ctx.cancel_event.is_set():
+            return CommandResult(output="Command cancelled.", success=False)
         parsed = self._prepare_command(parsed)
         cmd = self.registry.get(parsed.name)
         if cmd is None:

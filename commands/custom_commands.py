@@ -1164,35 +1164,48 @@ class RunCommand(BaseCommand):
         env.update(ctx.variables)
 
         try:
-            out = subprocess.run(
-                cleaned_args,
-                cwd=str(ctx.cwd),
-                env=env,
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=60,
-            )
+            out = self._run_process(cleaned_args, ctx, env)
         except FileNotFoundError:
             if os.name != "nt":
                 return CommandResult(output=f"Command not found: {cleaned_args[0]}", success=False)
-
-            out = subprocess.run(
-                ["cmd", "/c", " ".join(cleaned_args)],
-                cwd=str(ctx.cwd),
-                env=env,
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=60,
-            )
+            try:
+                out = self._run_process(["cmd", "/c", " ".join(cleaned_args)], ctx, env)
+            except subprocess.TimeoutExpired:
+                return CommandResult(output="Command timed out after 60 seconds.", success=False)
+            except Exception as e:
+                return CommandResult(output=f"Run error: {e}", success=False)
         except subprocess.TimeoutExpired:
             return CommandResult(output="Command timed out after 60 seconds.", success=False)
         except Exception as e:
             return CommandResult(output=f"Run error: {e}", success=False)
 
         text = "\n".join(part for part in [out.stdout.strip(), out.stderr.strip()] if part)
+        if ctx.cancel_event.is_set():
+            return CommandResult(output=text or "Native command cancelled.", success=False)
         return CommandResult(output=text, success=out.returncode == 0)
+
+    @staticmethod
+    def _run_process(args, ctx, env):
+        process = subprocess.Popen(
+            args,
+            cwd=str(ctx.cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        deadline = time.monotonic() + 60
+        while process.poll() is None:
+            if ctx.cancel_event.is_set():
+                process.terminate()
+                break
+            if time.monotonic() >= deadline:
+                process.kill()
+                raise subprocess.TimeoutExpired(args, timeout=60)
+            time.sleep(0.05)
+        stdout, stderr = process.communicate()
+        return type("ProcessResult", (), {"stdout": stdout, "stderr": stderr, "returncode": process.returncode})()
 
 
 class SetVarCommand(BaseCommand):

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 
 
 @dataclass
@@ -16,6 +17,7 @@ class ShellContext:
     registry: object | None = None
     plugins: object | None = None
     current_theme: str = "vscode-dark-plus"
+    cancel_event: Event = field(default_factory=Event, repr=False)
 
     def set_cwd(self, path: Path):
         from utils.safe_fs import ensure_path_allowed

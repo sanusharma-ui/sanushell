@@ -172,7 +172,6 @@ QMainWindow {{
 QWidget {{
     background-color: {theme.background};
     color: {theme.text};
-    font-family: Consolas;
 }}
 
 QLabel {{
@@ -185,9 +184,9 @@ QTextEdit {{
     background-color: {theme.surface};
     color: {theme.text};
     border: 1px solid {theme.border};
-    border-radius: 14px;
-    padding: 12px;
-    font-size: 12pt;
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 11pt;
     selection-background-color: {theme.selection};
     selection-color: {theme.text};
 }}
@@ -196,9 +195,9 @@ QLineEdit {{
     background-color: {theme.surface};
     color: {theme.text};
     border: 1px solid {theme.border};
-    border-radius: 14px;
-    padding: 11px;
-    font-size: 12pt;
+    border-radius: 8px;
+    padding: 9px 10px;
+    font-size: 11pt;
     selection-background-color: {theme.selection};
     selection-color: {theme.text};
 }}
@@ -211,8 +210,8 @@ QListWidget {{
     background-color: {theme.surface};
     color: {theme.text};
     border: 1px solid {theme.border};
-    border-radius: 14px;
-    padding: 6px;
+    border-radius: 8px;
+    padding: 4px;
     font-size: 10pt;
 }}
 
@@ -230,8 +229,8 @@ QPushButton {{
     background-color: {theme.button};
     color: {theme.text};
     border: 1px solid {theme.border};
-    border-radius: 12px;
-    padding: 10px 14px;
+    border-radius: 7px;
+    padding: 8px 12px;
     font-weight: 600;
 }}
 
@@ -248,5 +247,109 @@ QPushButton:pressed {{
 QStatusBar {{
     background-color: {theme.background};
     color: {theme.accent_alt};
+}}
+
+QFrame#sidebar, QFrame#inspector, QFrame#terminalHeader {{
+    background-color: {theme.surface};
+    border: 1px solid {theme.border};
+    border-radius: 10px;
+}}
+
+QFrame#sidebar {{
+    border-radius: 0;
+    border-top: 0;
+    border-bottom: 0;
+    border-left: 0;
+}}
+
+QLabel#brand {{
+    color: {theme.accent_alt};
+    font-size: 18pt;
+    font-weight: 700;
+}}
+
+QLabel#eyebrow {{
+    color: {theme.muted};
+    font-size: 8pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+
+QLabel#sectionTitle {{
+    color: {theme.accent};
+    font-size: 9pt;
+    font-weight: 700;
+}}
+
+QLabel#sessionPath {{
+    color: {theme.muted};
+    font-size: 9pt;
+}}
+
+QLabel#statusPill {{
+    background-color: {theme.surface_alt};
+    color: {theme.accent_alt};
+    border-radius: 9px;
+    padding: 3px 8px;
+    font-size: 8pt;
+    font-weight: 700;
+}}
+
+QPushButton#primaryButton {{
+    background-color: {theme.accent};
+    color: {theme.background};
+    border-color: {theme.accent};
+}}
+
+QPushButton#primaryButton:hover {{
+    background-color: {theme.accent_alt};
+    border-color: {theme.accent_alt};
+}}
+
+QPushButton#navButton {{
+    background-color: transparent;
+    border-color: transparent;
+    text-align: left;
+    padding: 8px;
+    color: {theme.muted};
+}}
+
+QPushButton#navButton:hover, QPushButton#navButton:checked {{
+    background-color: {theme.surface_alt};
+    border-color: {theme.border};
+    color: {theme.accent_alt};
+}}
+
+QTabWidget::pane {{
+    border: 0;
+    background: transparent;
+}}
+
+QTabBar::tab {{
+    background: {theme.background};
+    color: {theme.muted};
+    border: 1px solid transparent;
+    border-bottom: 2px solid transparent;
+    padding: 9px 13px;
+    margin-right: 3px;
+}}
+
+QTabBar::tab:selected {{
+    background: {theme.surface};
+    color: {theme.text};
+    border-color: {theme.border};
+    border-bottom-color: {theme.accent};
+}}
+
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 3px;
+}}
+
+QScrollBar::handle:vertical {{
+    background: {theme.border};
+    border-radius: 4px;
+    min-height: 24px;
 }}
 """
