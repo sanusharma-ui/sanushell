@@ -30,6 +30,16 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _parse_int(value: str | None, default: int, *, minimum: int | None = None) -> int:
+    """Parse an integer setting without letting a bad .env value break Orbit."""
+    text = (value or "").replace("`", "").strip()
+    try:
+        result = int(text) if text else default
+    except (TypeError, ValueError):
+        result = default
+    return max(minimum, result) if minimum is not None else result
+
+
 def _parse_user_ids(value: str | None) -> set[int]:
     result: set[int] = set()
     if not value:
@@ -118,11 +128,11 @@ class AIConfig:
             ai_provider_order=_parse_provider_order(os.getenv("AI_PROVIDER_ORDER")),
             ollama_base_url=(os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").strip().rstrip("/"),
             ollama_model=os.getenv("OLLAMA_MODEL", "").strip(),
-            ollama_timeout_seconds=max(1, int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120") or "120")),
+            ollama_timeout_seconds=_parse_int(os.getenv("OLLAMA_TIMEOUT_SECONDS"), 120, minimum=1),
             workspace_root=workspace_root,
             allow_outside_workspace=_parse_bool(os.getenv("AI_ALLOW_OUTSIDE_WORKSPACE"), default=False),
-            approval_timeout_minutes=int(os.getenv("AI_APPROVAL_TIMEOUT_MINUTES", "30") or "30"),
-            command_output_limit=int(os.getenv("AI_COMMAND_OUTPUT_LIMIT", "3500") or "3500"),
+            approval_timeout_minutes=_parse_int(os.getenv("AI_APPROVAL_TIMEOUT_MINUTES"), 30, minimum=1),
+            command_output_limit=_parse_int(os.getenv("AI_COMMAND_OUTPUT_LIMIT"), 3500, minimum=1),
         )
 
     def validate_for_telegram(self) -> list[str]:

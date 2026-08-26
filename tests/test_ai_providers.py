@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from ai.config import _parse_int
 from ai.llm import AgentPlanner
 from core.shell import Shell
 
@@ -183,6 +184,17 @@ class ProviderSelectionTests(unittest.TestCase):
         self.assertEqual(action.message, "groq response")
         self.assertEqual(gemini.calls, 0)
         self.assertEqual(groq.calls, 1)
+
+
+class ConfigParsingTests(unittest.TestCase):
+    def test_integer_setting_tolerates_markdown_backticks(self):
+        self.assertEqual(_parse_int("3500`   `", 100), 3500)
+
+    def test_invalid_integer_setting_uses_safe_default(self):
+        self.assertEqual(_parse_int("not-a-number", 120, minimum=1), 120)
+
+    def test_integer_setting_respects_minimum(self):
+        self.assertEqual(_parse_int("0", 120, minimum=1), 1)
 
 
 if __name__ == "__main__":
