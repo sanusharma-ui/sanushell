@@ -137,10 +137,56 @@ Create a `.env` file in the project root with values like:
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_ALLOWED_USER_IDS=your_numeric_telegram_user_id
+AI_PROVIDER=auto
+AI_PROVIDER_ORDER=gemini,groq,ollama
 GEMINI_API_KEY=your_gemini_key
 AI_WORKSPACE_ROOT=D:\riftshell
 AI_ALLOW_OUTSIDE_WORKSPACE=false
 ```
+
+### AI model providers
+
+Orbit supports Gemini, Groq, and local Ollama models without changing its command routing, memory, or safety logic.
+
+Select one provider explicitly:
+
+```env
+AI_PROVIDER=gemini
+```
+
+```env
+AI_PROVIDER=groq
+```
+
+```env
+AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_TIMEOUT_SECONDS=120
+```
+
+For Ollama, install and start Ollama first, then download the exact model configured above:
+
+```text
+ollama pull qwen2.5:7b
+```
+
+No additional Python package is required for Ollama; RiftShell uses its local HTTP API.
+
+When multiple providers are configured, `AI_PROVIDER` removes ambiguity:
+
+- `gemini`, `groq`, or `ollama` uses only that provider and does not silently send the request elsewhere.
+- `auto` tries configured providers in `AI_PROVIDER_ORDER` and falls back only when a provider is unavailable.
+- The default auto order is `gemini,groq,ollama`, preserving the existing cloud-provider behavior.
+
+To prefer local inference while retaining cloud fallback:
+
+```env
+AI_PROVIDER=auto
+AI_PROVIDER_ORDER=ollama,gemini,groq
+```
+
+To guarantee that Orbit never falls back to a cloud provider, use `AI_PROVIDER=ollama` rather than `auto`. With a localhost `OLLAMA_BASE_URL`, prompts stay on the local machine.
 
 Then run:
 

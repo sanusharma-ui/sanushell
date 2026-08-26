@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -90,66 +92,189 @@ class AgentPlanner:
 
         self.memory = MemoryManager(path=memory_path, limit=memory_turns, enabled=memory_enabled)
 
+        self._selected_provider = str(getattr(self.config, "ai_provider", os.getenv("AI_PROVIDER", "auto"))).strip().lower()
+        configured_order = getattr(self.config, "ai_provider_order", None)
+        if configured_order:
+            self._provider_order = tuple(str(item).strip().lower() for item in configured_order)
+        else:
+            self._provider_order = tuple(
+                item.strip().lower()
+                for item in os.getenv("AI_PROVIDER_ORDER", "gemini,groq,ollama").split(",")
+                if item.strip()
+            )
+
+        self._gemini_key = str(getattr(self.config, "gemini_api_key", "") or "").strip()
+        self._groq_key = str(getattr(self.config, "groq_api_key", os.getenv("GROQ_API_KEY", "")) or "").strip()
+        self._ollama_model = str(getattr(self.config, "ollama_model", os.getenv("OLLAMA_MODEL", "")) or "").strip()
+        self._ollama_base_url = str(
+            getattr(self.config, "ollama_base_url", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
+            or "http://127.0.0.1:11434"
+        ).strip().rstrip("/")
+        self._ollama_timeout = max(
+            1,
+            int(getattr(self.config, "ollama_timeout_seconds", os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")) or 120),
+        )
+
         # 2. Gemini Setup
         self._gemini = None
-        if getattr(self.config, "gemini_api_key", None):
+        self._gemini_setup_error = ""
+        if self._gemini_key:
             try:
                 import google.generativeai as genai
-                genai.configure(api_key=self.config.gemini_api_key)
+                genai.configure(api_key=self._gemini_key)
                 self._gemini = genai.GenerativeModel(getattr(self.config, "gemini_model", "gemini-2.5-flash"))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._gemini_setup_error = str(exc)
 
-        # 3. Groq Fallback Setup
+        # 3. Groq Setup
         self._groq = None
-        groq_key = getattr(self.config, "groq_api_key", os.getenv("GROQ_API_KEY"))
-        if groq_key:
+        self._groq_setup_error = ""
+        self._groq_model = str(
+            getattr(self.config, "groq_model", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+            or "llama-3.3-70b-versatile"
+        ).strip()
+        if self._groq_key:
             try:
                 import groq
-                self._groq = groq.Groq(api_key=groq_key)
-                self._groq_model = getattr(self.config, "groq_model", os.getenv("GROQ_MODEL", "llama3-8b-8192"))
-            except Exception:
-                pass
+                self._groq = groq.Groq(api_key=self._groq_key)
+            except Exception as exc:
+                self._groq_setup_error = str(exc)
 
     def plan(self, user_text: str) -> AgentAction:
         direct = self._fallback_plan(user_text)
-        if direct.action != "respond" or direct.message or (self._gemini is None and self._groq is None):
+        if direct.action != "respond" or direct.message or not self._model_routing_enabled():
             return self._remember_action(user_text, self._validate_action(direct))
 
         prompt = self._build_prompt(user_text)
         action = None
-        error_msg = ""
+        errors: list[str] = []
 
-        # Attempt 1: Gemini
-        if self._gemini:
-            try:
-                response = self._gemini.generate_content(prompt)
-                text = getattr(response, "text", "") or ""
-                action = AgentAction.from_payload(_extract_json(text))
-            except Exception as exc:
-                error_msg += f"Gemini error: {exc} | "
+        try:
+            providers = self._provider_sequence()
+        except ValueError as exc:
+            providers = []
+            errors.append(str(exc))
 
-        # Attempt 2: Groq Fallback
-        if action is None and self._groq:
+        for provider in providers:
             try:
-                response = self._groq.chat.completions.create(
-                    messages=[{"role": "system", "content": prompt}],
-                    model=self._groq_model,
-                    temperature=0.1,
-                )
-                text = response.choices[0].message.content
+                text = self._call_provider(provider, prompt)
                 action = AgentAction.from_payload(_extract_json(text))
+                break
             except Exception as exc:
-                error_msg += f"Groq error: {exc}"
+                errors.append(f"{provider.title()}: {exc}")
 
         # If both fail
         if action is None:
+            details = " | ".join(errors) or "No configured provider is available."
             return self._remember_action(user_text, AgentAction(
                 action="respond",
-                message=f"I could not reach the AI model right now.\nDetails: {error_msg}",
+                message=f"I could not reach the selected AI provider.\nDetails: {details}",
             ))
 
         return self._remember_action(user_text, self._validate_action(action))
+
+    def _model_routing_enabled(self) -> bool:
+        if self._selected_provider != "auto":
+            return True
+        return bool(self._provider_sequence())
+
+    def _provider_sequence(self) -> list[str]:
+        valid = {"gemini", "groq", "ollama"}
+        if self._selected_provider != "auto":
+            if self._selected_provider not in valid:
+                raise ValueError(
+                    f"Invalid AI provider '{self._selected_provider}'. Choose auto, gemini, groq, or ollama."
+                )
+            return [self._selected_provider]
+
+        invalid = [provider for provider in self._provider_order if provider not in valid]
+        if invalid:
+            raise ValueError(f"Invalid provider in AI_PROVIDER_ORDER: {invalid[0]}")
+        return [provider for provider in self._provider_order if self._provider_is_configured(provider)]
+
+    def _provider_is_configured(self, provider: str) -> bool:
+        return {
+            "gemini": bool(self._gemini_key),
+            "groq": bool(self._groq_key),
+            "ollama": bool(self._ollama_model),
+        }.get(provider, False)
+
+    def _call_provider(self, provider: str, prompt: str) -> str:
+        if provider == "gemini":
+            return self._call_gemini(prompt)
+        if provider == "groq":
+            return self._call_groq(prompt)
+        if provider == "ollama":
+            return self._call_ollama(prompt)
+        raise ValueError(f"Unsupported AI provider: {provider}")
+
+    def _call_gemini(self, prompt: str) -> str:
+        if not self._gemini_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured.")
+        if self._gemini is None:
+            detail = f" ({self._gemini_setup_error})" if self._gemini_setup_error else ""
+            raise RuntimeError(f"Gemini client is unavailable{detail}.")
+        response = self._gemini.generate_content(prompt)
+        text = getattr(response, "text", "") or ""
+        if not text.strip():
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+
+    def _call_groq(self, prompt: str) -> str:
+        if not self._groq_key:
+            raise RuntimeError("GROQ_API_KEY is not configured.")
+        if self._groq is None:
+            detail = f" ({self._groq_setup_error})" if self._groq_setup_error else ""
+            raise RuntimeError(f"Groq client is unavailable{detail}.")
+        response = self._groq.chat.completions.create(
+            messages=[{"role": "system", "content": prompt}],
+            model=self._groq_model,
+            temperature=0.1,
+        )
+        text = response.choices[0].message.content or ""
+        if not text.strip():
+            raise RuntimeError("Groq returned an empty response.")
+        return text
+
+    def _call_ollama(self, prompt: str) -> str:
+        if not self._ollama_model:
+            raise RuntimeError("OLLAMA_MODEL is not configured.")
+
+        endpoint = f"{self._ollama_base_url}/api/generate"
+        payload = json.dumps({
+            "model": self._ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1},
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._ollama_timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail or exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Ollama is not reachable at {self._ollama_base_url}. Start Ollama and confirm OLLAMA_BASE_URL."
+            ) from exc
+
+        try:
+            response_payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Ollama returned an invalid HTTP response.") from exc
+        if response_payload.get("error"):
+            raise RuntimeError(str(response_payload["error"]))
+        text = str(response_payload.get("response", ""))
+        if not text.strip():
+            raise RuntimeError("Ollama returned an empty response.")
+        return text
 
     def _remember_action(self, user_text: str, action: AgentAction) -> AgentAction:
         self.memory.add("user", user_text)
@@ -201,7 +326,7 @@ class AgentPlanner:
             )
 
         if self._is_greeting(lowered):
-            if self._gemini is not None or self._groq is not None:
+            if self._model_routing_enabled():
                 return AgentAction(action="respond", message="")
             return AgentAction(
                 action="respond",
@@ -209,7 +334,7 @@ class AgentPlanner:
             )
 
         if self._is_simple_general_question(lowered):
-            if self._gemini is not None or self._groq is not None:
+            if self._model_routing_enabled():
                 return AgentAction(action="respond", message="")
             return AgentAction(action="respond", message=self._answer_simple_general_question(lowered))
 
@@ -232,7 +357,7 @@ class AgentPlanner:
         if len(words) == 1 and first_word in command_names:
             return AgentAction(action="shell", command=text, message="I will run that RiftShell command after your approval.")
 
-        if self._gemini is None and self._groq is None:
+        if not self._model_routing_enabled():
             return self._offline_response(text)
         return AgentAction(action="respond", message="")
 
