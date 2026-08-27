@@ -215,5 +215,16 @@ class ResponseEnvelopeTests(unittest.TestCase):
         self.assertEqual(_extract_json(markdown), {"action": "respond", "message": markdown})
 
 
+class AssistantLanguageTests(unittest.TestCase):
+    def test_prompt_enforces_professional_english_for_every_user_language(self):
+        planner = make_planner(make_config())
+
+        prompt = planner._build_prompt("Mujhe project samjhao")
+
+        self.assertIn("English-only workspace assistant", prompt)
+        self.assertIn("Always respond in professional English", prompt)
+        self.assertIn("regardless of the language used by the user", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

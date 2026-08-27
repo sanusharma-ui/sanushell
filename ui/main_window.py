@@ -13,15 +13,9 @@ from PySide6.QtWidgets import (
 )
 
 from core.shell import Shell
+from ai.code_writer import WriteResult, apply_file_writes, preview_file_writes
 from ai.safety import SafetyPolicy
 from ui.themes import build_stylesheet, get_theme, list_themes
-
-
-RISKY_COMMANDS = {
-    "delete", "remove", "del", "shift", "move", "rename", "run", "exec",
-    "native", "open", "download", "kill", "taskkill", "zip", "unzip",
-    "gpush", "gps", "gcheckout", "gco",
-}
 
 
 def fuzzy_score(query: str, text: str) -> int | None:
@@ -126,6 +120,29 @@ class OrbitWorker(QThread):
             self.planned.emit(planner.plan(self.prompt))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class FileWriteWorker(QThread):
+    result_ready = Signal(object)
+
+    def __init__(self, files, workspace_root, allow_outside_workspace, current_dir, parent=None):
+        super().__init__(parent)
+        self.files = files
+        self.workspace_root = workspace_root
+        self.allow_outside_workspace = allow_outside_workspace
+        self.current_dir = current_dir
+
+    def run(self):
+        try:
+            result = apply_file_writes(
+                self.files,
+                self.workspace_root,
+                self.allow_outside_workspace,
+                self.current_dir,
+            )
+        except Exception as exc:
+            result = WriteResult(output=f"File update failed: {exc}", success=False)
+        self.result_ready.emit(result)
 
 
 class CommandPalette(QDialog):
@@ -239,6 +256,7 @@ class TerminalSession(QWidget):
     def __init__(self, shell: Shell, title: str, preferences: dict, parent=None):
         super().__init__(parent)
         self.shell, self.title, self.preferences = shell, title, preferences
+        self.safety = SafetyPolicy()
         self.worker: CommandWorker | None = None
         self.active_command = ""
         self.name_label = QLabel(title)
@@ -336,11 +354,13 @@ class TerminalSession(QWidget):
         QApplication.clipboard().setText(self.console.toPlainText())
         self.state_label.setText("COPIED")
 
-    def _needs_confirmation(self, command: str) -> bool:
-        first = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
-        return self.preferences["confirm_risky"] and first in RISKY_COMMANDS
+    def _approval_decision(self, command: str):
+        if not self.preferences["confirm_risky"]:
+            return None
+        decision = self.safety.check_shell_command(command)
+        return decision if decision.requires_approval else None
 
-    def run_command(self):
+    def run_command(self, approval_granted: bool = False):
         command = self.input.text().strip()
         if not command or self.is_busy:
             return False
@@ -348,12 +368,13 @@ class TerminalSession(QWidget):
             self.clear_console()
             self.input.clear()
             return True
-        if self._needs_confirmation(command):
+        decision = None if approval_granted else self._approval_decision(command)
+        if decision:
             dialog = QMessageBox(self)
             dialog.setIcon(QMessageBox.Warning)
             dialog.setWindowTitle("Confirm command")
-            dialog.setText("This command can change files, launch a program, or affect a system process.")
-            dialog.setInformativeText(command)
+            dialog.setText(decision.reason)
+            dialog.setInformativeText(f"Command:\n{command}")
             dialog.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
             dialog.setDefaultButton(QMessageBox.Cancel)
             if dialog.exec() != QMessageBox.Yes:
@@ -411,7 +432,7 @@ class TerminalSession(QWidget):
 
 
 class OrbitPanel(QFrame):
-    command_requested = Signal(str)
+    action_requested = Signal(object, bool)
 
     def __init__(self, session_provider, parent=None):
         super().__init__(parent)
@@ -419,7 +440,7 @@ class OrbitPanel(QFrame):
         self.session_provider = session_provider
         self.safety = SafetyPolicy()
         self.worker: OrbitWorker | None = None
-        self.pending_command = ""
+        self.pending_action = None
         heading = QLabel("ORBIT")
         heading.setObjectName("sectionTitle")
         self.thinking_indicator = QLabel("")
@@ -502,7 +523,8 @@ class OrbitPanel(QFrame):
         self.worker.start()
 
     def _show_plan(self, action):
-        self.pending_command = ""
+        self.pending_action = None
+        self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         message = action.message or (
@@ -513,7 +535,7 @@ class OrbitPanel(QFrame):
         if action.action == "shell" and action.command:
             decision = self.safety.check_action(action.action, action.command)
             if decision.requires_approval:
-                self.pending_command = action.command
+                self.pending_action = action
                 self._stream("Orbit", f"{message}\n\nProposed command:\n{action.command}\n\nApproval is required because {decision.reason}")
                 self.status.setText("Review the proposed command before approving it.")
                 self.approve_button.setEnabled(True)
@@ -521,10 +543,36 @@ class OrbitPanel(QFrame):
             else:
                 self._stream("Orbit", f"{message}\n\nRunning in the active terminal:\n{action.command}")
                 self.status.setText("Executing in the active terminal. Output will appear there shortly.")
-                self.command_requested.emit(action.command)
+                self.action_requested.emit(action, False)
         elif action.action == "code_write":
-            self._stream("Orbit", f"{message}\n\nThis plan writes {len(action.files)} file(s). Use the existing Telegram approval flow to apply code-write actions.")
-            self.status.setText("Code-write plans are intentionally approval-only here.")
+            session = self.session_provider()
+            if session is None:
+                self._stream("Orbit", "The active workspace session is no longer available.")
+                self.status.setText("Open a workspace session and try again.")
+                return
+            from ai.config import AIConfig
+
+            config = AIConfig.from_env()
+            preview = preview_file_writes(
+                action.files,
+                config.workspace_root,
+                config.allow_outside_workspace,
+                session.shell.ctx.cwd,
+            )
+            if not preview.success:
+                self._stream("Orbit", f"{message}\n\nI could not prepare a safe file preview:\n\n{preview.output}")
+                self.status.setText("The proposed file change was blocked.")
+                return
+            paths = ", ".join(file.path for file in action.files)
+            self.pending_action = action
+            self._stream(
+                "Orbit",
+                f"{message}\n\nFiles: {paths}\n\nReview the proposed diff:\n\n```diff\n{preview.output}\n```",
+            )
+            self.status.setText("Review the diff before applying these file changes.")
+            self.approve_button.setText("Approve changes")
+            self.approve_button.setEnabled(True)
+            self.reject_button.setEnabled(True)
         else:
             self._stream("Orbit", message)
             self.status.setText("No command will run for this response.")
@@ -592,16 +640,23 @@ class OrbitPanel(QFrame):
         self.stream_index += len(chunk)
 
     def approve(self):
-        if self.pending_command:
-            self.command_requested.emit(self.pending_command)
-            self._append("Orbit", "Approved. Executing in the active terminal; the output will appear there.")
-            self.status.setText("Executing approved command in the active terminal.")
-        self.pending_command = ""
+        if self.pending_action:
+            action = self.pending_action
+            self.action_requested.emit(action, True)
+            if action.action == "code_write":
+                self._append("Orbit", "Approved. Applying the reviewed file changes with backups.")
+                self.status.setText("Applying approved file changes.")
+            else:
+                self._append("Orbit", "Approved. Executing in the active terminal; the output will appear there.")
+                self.status.setText("Executing approved command in the active terminal.")
+        self.pending_action = None
+        self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
 
     def dismiss(self):
-        self.pending_command = ""
+        self.pending_action = None
+        self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.status.setText("Ask anything, or request a workspace action.")
@@ -615,6 +670,14 @@ class OrbitPanel(QFrame):
         self._stream("Orbit", f"The command did not complete: {command}\n{detail}\n\nSee the terminal for full details.")
         self.status.setText("Command failed. Full diagnostics are in the terminal.")
 
+    def show_write_result(self, result):
+        if result.success:
+            self._stream("Orbit", f"The approved file changes were applied successfully.\n\n{result.output}")
+            self.status.setText("File changes applied. Backups are available for overwritten files.")
+            return
+        self._stream("Orbit", f"The file changes were not applied.\n\n{result.output}")
+        self.status.setText("File update failed or was blocked.")
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -624,6 +687,7 @@ class MainWindow(QMainWindow):
         self.theme = get_theme(self.preferences["theme"])
         self.history = self._load_history() if self.preferences["restore_history"] else []
         self._orbit_execution: tuple[TerminalSession, str] | None = None
+        self._orbit_write_worker: FileWriteWorker | None = None
         self.setWindowTitle("RiftShell — Developer Workspace")
         self.resize(1440, 880)
         self.setMinimumSize(1080, 680)
@@ -659,7 +723,7 @@ class MainWindow(QMainWindow):
         self.tabs.tabCloseRequested.connect(self.close_session_at)
         root.addWidget(self.tabs)
         self.orbit = OrbitPanel(self.current_session)
-        self.orbit.command_requested.connect(self._run_orbit_command)
+        self.orbit.action_requested.connect(self._run_orbit_action)
         root.addWidget(self.orbit)
         root.setSizes([250, 900, 300])
         self.root_splitter = root
@@ -960,16 +1024,46 @@ class MainWindow(QMainWindow):
     def toggle_orbit(self):
         self.orbit.setVisible(not self.orbit.isVisible())
 
-    def _run_orbit_command(self, command: str):
+    def _run_orbit_action(self, action, approval_granted: bool = False):
         if session := self.current_session():
             if session.is_busy:
                 self.orbit._append("Orbit", "The active terminal is busy. Wait for the current command to finish, then try again.")
                 self.orbit.status.setText("Waiting for the active terminal to become available.")
                 return
+            if action.action == "code_write":
+                if not approval_granted:
+                    self.orbit._append("Orbit", "File changes require review and approval before they can be applied.")
+                    return
+                if self._orbit_write_worker and self._orbit_write_worker.isRunning():
+                    self.orbit._append("Orbit", "Another file update is already in progress.")
+                    return
+                from ai.config import AIConfig
+
+                config = AIConfig.from_env()
+                self._orbit_write_worker = FileWriteWorker(
+                    action.files,
+                    config.workspace_root,
+                    config.allow_outside_workspace,
+                    session.shell.ctx.cwd,
+                    self,
+                )
+                self._orbit_write_worker.result_ready.connect(self.orbit.show_write_result)
+                self._orbit_write_worker.finished.connect(self._clear_orbit_write_worker)
+                self._orbit_write_worker.start()
+                return
+            if action.action != "shell":
+                return
+            command = action.command
             self._orbit_execution = (session, command)
             session.input.setText(command)
-            if not session.run_command():
+            if not session.run_command(approval_granted=approval_granted):
                 self._orbit_execution = None
+
+    def _clear_orbit_write_worker(self):
+        worker = self._orbit_write_worker
+        self._orbit_write_worker = None
+        if worker:
+            worker.deleteLater()
 
     def _on_terminal_command_complete(self, session: TerminalSession, command: str, result):
         if self._orbit_execution != (session, command):
@@ -978,6 +1072,10 @@ class MainWindow(QMainWindow):
         self.orbit.show_execution_result(command, result)
 
     def closeEvent(self, event):
+        if self._orbit_write_worker and self._orbit_write_worker.isRunning():
+            QMessageBox.warning(self, "File changes in progress", "Wait for Orbit to finish applying the approved file changes.")
+            event.ignore()
+            return
         for index in range(self.tabs.count()):
             if session := self.tabs.widget(index):
                 if session.is_busy:

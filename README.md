@@ -203,6 +203,18 @@ The AI layer is designed to help with shell tasks using plain language, while st
 - system-level actions are checked before execution
 - the bot acts as an assistant layer, not as a replacement for the core shell
 
+Orbit communicates in professional English. File understanding is separate from
+the shell's raw `read` command: requests such as `Explain README.md`, `Review
+ai/safety.py for bugs`, or `Explain the structure of this project` load bounded
+workspace context and return an explanation in the Orbit panel. Sensitive files
+such as `.env`, private keys, AI memory, binary files, dependency folders, and
+backup folders are not included in project inspection context.
+
+When a review produces file changes, the desktop app shows a unified diff and
+requires one explicit approval before writing. Existing files are backed up under
+`.ai_backups/` before the approved replacement is applied. Use `/cmd read <file>`
+when raw file content in the terminal is explicitly desired.
+
 ## Extending the project
 
 If you want to add a new command, create a plugin under `plugins/<plugin_name>/plugin.py` and expose a `plugin` instance.
