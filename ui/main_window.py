@@ -431,7 +431,9 @@ class OrbitPanel(QFrame):
         self.stream_timer.timeout.connect(self._stream_next_chunk)
         self.stream_text = ""
         self.stream_index = 0
+        self.stream_message_index: int | None = None
         self.stream_done = None
+        self.messages: list[tuple[str, str]] = []
         self.status = QLabel("Ask anything, or request a workspace action.")
         self.status.setWordWrap(True)
         self.conversation = QTextEdit()
@@ -532,37 +534,61 @@ class OrbitPanel(QFrame):
         self.status.setText("Could not reach the configured AI provider.")
 
     def _append(self, label: str, text: str):
-        self.conversation.append(f"<b>{escape(label)}</b><br>{escape(text).replace(chr(10), '<br>')}<br>")
+        self._finish_stream()
+        self.messages.append((label, text))
+        self._render_conversation()
 
-    def _stream(self, label: str, text: str, on_done=None):
-        """Reveal a completed plan smoothly instead of dropping a text wall at once."""
+    @staticmethod
+    def _escape_user_markdown(text: str) -> str:
+        """Keep user input literal while allowing Orbit replies to use Markdown."""
+        for char in "\\`*_{}[]<>":
+            text = text.replace(char, f"\\{char}")
+        return text
+
+    def _render_conversation(self):
+        blocks = []
+        for label, text in self.messages:
+            body = self._escape_user_markdown(text) if label == "You" else text
+            blocks.append(f"**{label}**\n\n{body}")
+        self.conversation.setMarkdown("\n\n---\n\n".join(blocks))
+        cursor = self.conversation.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.conversation.setTextCursor(cursor)
+        self.conversation.ensureCursorVisible()
+
+    def _finish_stream(self):
+        if self.stream_message_index is None:
+            return
         if self.stream_timer.isActive():
             self.stream_timer.stop()
+        label, _ = self.messages[self.stream_message_index]
+        self.messages[self.stream_message_index] = (label, self.stream_text)
+        self.stream_index = len(self.stream_text)
+        self.stream_message_index = None
+
+    def _stream(self, label: str, text: str, on_done=None):
+        """Reveal a response while continuously rendering its Markdown structure."""
+        self._finish_stream()
         self.stream_text = text
         self.stream_index = 0
         self.stream_done = on_done
-        cursor = self.conversation.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f"<b>{escape(label)}</b><br>")
-        self.conversation.setTextCursor(cursor)
-        self.stream_timer.start(9)
+        self.messages.append((label, ""))
+        self.stream_message_index = len(self.messages) - 1
+        self._render_conversation()
+        self.stream_timer.start(16)
 
     def _stream_next_chunk(self):
         if self.stream_index >= len(self.stream_text):
             self.stream_timer.stop()
-            cursor = self.conversation.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            cursor.insertText("\n\n")
-            self.conversation.setTextCursor(cursor)
+            self.stream_message_index = None
             if self.stream_done:
                 self.stream_done()
             return
-        chunk = self.stream_text[self.stream_index:self.stream_index + 4]
-        cursor = self.conversation.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertText(chunk)
-        self.conversation.setTextCursor(cursor)
-        self.conversation.ensureCursorVisible()
+        chunk = self.stream_text[self.stream_index:self.stream_index + 18]
+        if self.stream_message_index is not None:
+            label, current = self.messages[self.stream_message_index]
+            self.messages[self.stream_message_index] = (label, current + chunk)
+        self._render_conversation()
         self.stream_index += len(chunk)
 
     def approve(self):

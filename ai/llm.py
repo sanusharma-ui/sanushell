@@ -14,22 +14,54 @@ from ai.config import AIConfig
 from core.parser import CommandParser
 
 
-def _extract_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        return {"action": "respond", "message": text or "No response from model."}
+def _decode_json_value(text: str):
+    """Decode a model JSON response, tolerating fences and leading prose."""
+    cleaned = text.strip()
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        cleaned = cleaned[3:-3].strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip()
 
     try:
-        return json.loads(text[start : end + 1])
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        return {"action": "respond", "message": text}
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def _extract_json(text: str) -> dict:
+    """Return the invisible action envelope without leaking it into Orbit chat."""
+    original = text.strip()
+    value = _decode_json_value(original)
+
+    # Some models double-encode the complete action object as a JSON string.
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        decoded = _decode_json_value(value)
+        if decoded is None:
+            break
+        value = decoded
+
+    if not isinstance(value, dict):
+        return {"action": "respond", "message": original or "No response from model."}
+
+    # A common failure mode is putting another complete action envelope inside
+    # `message`. Unwrap it so users see the answer, not Orbit's transport JSON.
+    if str(value.get("action", "")).lower() == "respond":
+        message = value.get("message")
+        if isinstance(message, str):
+            nested = _decode_json_value(message)
+            if isinstance(nested, dict) and "action" in nested:
+                value = nested
+
+    return value
 
 
 class MemoryManager:
@@ -122,7 +154,10 @@ class AgentPlanner:
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=self._gemini_key)
-                self._gemini = genai.GenerativeModel(getattr(self.config, "gemini_model", "gemini-2.5-flash"))
+                self._gemini = genai.GenerativeModel(
+                    getattr(self.config, "gemini_model", "gemini-2.5-flash"),
+                    generation_config={"response_mime_type": "application/json"},
+                )
             except Exception as exc:
                 self._gemini_setup_error = str(exc)
 
@@ -230,6 +265,7 @@ class AgentPlanner:
             messages=[{"role": "system", "content": prompt}],
             model=self._groq_model,
             temperature=0.1,
+            response_format={"type": "json_object"},
         )
         text = response.choices[0].message.content or ""
         if not text.strip():
@@ -605,13 +641,13 @@ class AgentPlanner:
         return f"""
 You are Orbit: a friendly, professional workspace assistant inside RiftShell.
 You can chat naturally, answer general questions, clarify intent, and execute safe shell actions when the user clearly wants computer work.
-Your output must always be STRICT, VALID JSON.
+Your output must always be STRICT, VALID JSON. This JSON is an internal transport envelope and is never shown to the user.
 
 Allowed JSON shapes:
 {{"action":"shell","command":"STRICT_COMMAND_HERE","message":"short explanation"}}
 {{"action":"screenshot","message":"taking screenshot"}}
 {{"action":"code_write","message":"writing code","files":[{{"path":"EXACT_GIVEN_PATH","content":"full code"}}]}}
-{{"action":"respond","message":"chat or clarification"}}
+{{"action":"respond","message":"chat or clarification in Markdown"}}
 
 Runtime context:
 - Current directory: {current_dir}
@@ -638,6 +674,7 @@ UNIVERSAL RULES (READ AND OBEY):
 14. CONTEXT: Understand follow-ups using Recent Conversation History and Latest terminal output. If the user asks where command output is, explain that it appears in the active terminal; do not run `last` unless they explicitly ask to print the previous output again.
 15. COLLISIONS: Words such as "now", "last", "path", "where", "history", and "help" may occur in ordinary conversation. Only treat them as commands when the overall sentence clearly requests a computer action.
 16. PLANNING: When asked to make a plan, think through a problem, compare options, or provide advice, respond with a useful plan in natural language. Do not turn planning into shell commands unless the user explicitly asks you to inspect or modify the workspace.
+17. RESPONSE FORMAT: For "respond" messages, use clean GitHub-Flavored Markdown when structure helps: short headings, blank lines, numbered or bulleted lists, and fenced code blocks with a language tag. Do not put the action JSON itself, or a second action envelope, inside "message". Avoid HTML and decorative clutter.
 
 Routing examples:
 - User: "hello" -> {{"action":"respond","message":"Hello. How can I help?"}}

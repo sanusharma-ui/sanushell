@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai.config import _parse_int
-from ai.llm import AgentPlanner
+from ai.llm import AgentPlanner, _extract_json
 from core.shell import Shell
 
 
@@ -195,6 +195,24 @@ class ConfigParsingTests(unittest.TestCase):
 
     def test_integer_setting_respects_minimum(self):
         self.assertEqual(_parse_int("0", 120, minimum=1), 1)
+
+
+class ResponseEnvelopeTests(unittest.TestCase):
+    def test_nested_action_envelope_is_unwrapped(self):
+        inner = {"action": "respond", "message": "## Plan\n\n1. Build API"}
+        outer = {"action": "respond", "message": json.dumps(inner)}
+
+        self.assertEqual(_extract_json(json.dumps(outer)), inner)
+
+    def test_double_encoded_action_envelope_is_unwrapped(self):
+        payload = {"action": "respond", "message": "**Clean answer**"}
+
+        self.assertEqual(_extract_json(json.dumps(json.dumps(payload))), payload)
+
+    def test_plain_markdown_becomes_a_response(self):
+        markdown = "## Plan\n\n- Add routes"
+
+        self.assertEqual(_extract_json(markdown), {"action": "respond", "message": markdown})
 
 
 if __name__ == "__main__":
