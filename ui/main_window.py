@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from html import escape
 from pathlib import Path
 
@@ -16,6 +17,45 @@ from core.shell import Shell
 from ai.code_writer import WriteResult, apply_file_writes, preview_file_writes
 from ai.safety import SafetyPolicy
 from ui.themes import build_stylesheet, get_theme, list_themes
+
+
+def pending_action_reply(text: str) -> str | None:
+    """Classify an explicit reply to a proposal waiting for approval."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+    if not normalized:
+        return None
+
+    rejection = re.search(
+        r"\b(?:cancel|deny|dismiss|reject|don t|do not|mat karo|mat likho|nahi|nahin)\b",
+        normalized,
+    )
+    if rejection or normalized in {"no", "nope", "cancel it"}:
+        return "reject"
+
+    if normalized in {
+        "approve", "approved", "yes", "yep", "ok", "okay", "haan", "han",
+        "proceed", "go ahead", "kar do", "karo", "likh do", "save it",
+    }:
+        return "approve"
+
+    has_affirmation = bool(
+        re.match(r"^(?:yes|yep|ok|okay|haan|han|sure|please)\b", normalized)
+    )
+    has_apply_instruction = bool(
+        re.search(
+            r"\b(?:apply|approve|proceed|save|push|write|go ahead|kar do|karo|likh do|daal do)\b",
+            normalized,
+        )
+    )
+    if has_affirmation and has_apply_instruction:
+        return "approve"
+    if re.search(
+        r"\b(?:apply (?:it|this|the changes?)|write (?:it|this code)|save (?:it|this)|"
+        r"changes? apply karo|code likh do)\b",
+        normalized,
+    ):
+        return "approve"
+    return None
 
 
 def fuzzy_score(query: str, text: str) -> int | None:
@@ -125,12 +165,21 @@ class OrbitWorker(QThread):
 class FileWriteWorker(QThread):
     result_ready = Signal(object)
 
-    def __init__(self, files, workspace_root, allow_outside_workspace, current_dir, parent=None):
+    def __init__(
+        self,
+        files,
+        workspace_root,
+        allow_outside_workspace,
+        current_dir,
+        expected_snapshots=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.files = files
         self.workspace_root = workspace_root
         self.allow_outside_workspace = allow_outside_workspace
         self.current_dir = current_dir
+        self.expected_snapshots = expected_snapshots
 
     def run(self):
         try:
@@ -139,6 +188,7 @@ class FileWriteWorker(QThread):
                 self.workspace_root,
                 self.allow_outside_workspace,
                 self.current_dir,
+                self.expected_snapshots,
             )
         except Exception as exc:
             result = WriteResult(output=f"File update failed: {exc}", success=False)
@@ -432,7 +482,7 @@ class TerminalSession(QWidget):
 
 
 class OrbitPanel(QFrame):
-    action_requested = Signal(object, bool)
+    action_requested = Signal(object, bool, object)
 
     def __init__(self, session_provider, parent=None):
         super().__init__(parent)
@@ -441,6 +491,7 @@ class OrbitPanel(QFrame):
         self.safety = SafetyPolicy()
         self.worker: OrbitWorker | None = None
         self.pending_action = None
+        self.pending_snapshots = None
         heading = QLabel("ORBIT")
         heading.setObjectName("sectionTitle")
         self.thinking_indicator = QLabel("")
@@ -510,6 +561,25 @@ class OrbitPanel(QFrame):
         prompt, session = self.input.text().strip(), self.session_provider()
         if not prompt or session is None or self.worker and self.worker.isRunning():
             return
+
+        # A confirmation typed into the chat box approves the exact proposal
+        # already on screen.  Do not send it back to the model as a new prompt:
+        # doing so used to discard the generated code and elicit replies such as
+        # "please provide the code" instead of applying the reviewed write.
+        if self.pending_action:
+            decision = pending_action_reply(prompt)
+            if decision == "approve":
+                self._append("You", prompt)
+                self.input.clear()
+                self.approve()
+                return
+            if decision == "reject":
+                self._append("You", prompt)
+                self.input.clear()
+                self.dismiss()
+                self._append("Orbit", "The proposed action was dismissed. Nothing was changed.")
+                return
+
         self._append("You", prompt)
         self.input.clear()
         self.status.setText("Thinking with conversation and workspace context…")
@@ -524,6 +594,7 @@ class OrbitPanel(QFrame):
 
     def _show_plan(self, action):
         self.pending_action = None
+        self.pending_snapshots = None
         self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
@@ -543,7 +614,7 @@ class OrbitPanel(QFrame):
             else:
                 self._stream("Orbit", f"{message}\n\nRunning in the active terminal:\n{action.command}")
                 self.status.setText("Executing in the active terminal. Output will appear there shortly.")
-                self.action_requested.emit(action, False)
+                self.action_requested.emit(action, False, None)
         elif action.action == "code_write":
             session = self.session_provider()
             if session is None:
@@ -565,6 +636,7 @@ class OrbitPanel(QFrame):
                 return
             paths = ", ".join(file.path for file in action.files)
             self.pending_action = action
+            self.pending_snapshots = preview.snapshots
             self._stream(
                 "Orbit",
                 f"{message}\n\nFiles: {paths}\n\nReview the proposed diff:\n\n```diff\n{preview.output}\n```",
@@ -642,7 +714,8 @@ class OrbitPanel(QFrame):
     def approve(self):
         if self.pending_action:
             action = self.pending_action
-            self.action_requested.emit(action, True)
+            snapshots = self.pending_snapshots
+            self.action_requested.emit(action, True, snapshots)
             if action.action == "code_write":
                 self._append("Orbit", "Approved. Applying the reviewed file changes with backups.")
                 self.status.setText("Applying approved file changes.")
@@ -650,12 +723,14 @@ class OrbitPanel(QFrame):
                 self._append("Orbit", "Approved. Executing in the active terminal; the output will appear there.")
                 self.status.setText("Executing approved command in the active terminal.")
         self.pending_action = None
+        self.pending_snapshots = None
         self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
 
     def dismiss(self):
         self.pending_action = None
+        self.pending_snapshots = None
         self.approve_button.setText("Approve & run")
         self.approve_button.setEnabled(False)
         self.reject_button.setEnabled(False)
@@ -1024,7 +1099,9 @@ class MainWindow(QMainWindow):
     def toggle_orbit(self):
         self.orbit.setVisible(not self.orbit.isVisible())
 
-    def _run_orbit_action(self, action, approval_granted: bool = False):
+    def _run_orbit_action(
+        self, action, approval_granted: bool = False, expected_snapshots=None
+    ):
         if session := self.current_session():
             if session.is_busy:
                 self.orbit._append("Orbit", "The active terminal is busy. Wait for the current command to finish, then try again.")
@@ -1045,6 +1122,7 @@ class MainWindow(QMainWindow):
                     config.workspace_root,
                     config.allow_outside_workspace,
                     session.shell.ctx.cwd,
+                    expected_snapshots,
                     self,
                 )
                 self._orbit_write_worker.result_ready.connect(self.orbit.show_write_result)

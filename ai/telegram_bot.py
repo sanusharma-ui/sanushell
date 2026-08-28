@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from ai.actions import AgentAction
-from ai.code_writer import apply_file_writes
+from ai.code_writer import FileSnapshot, apply_file_writes, preview_file_writes
 from ai.config import AIConfig
 from ai.llm import AgentPlanner
 from ai.safety import SafetyPolicy
@@ -21,6 +21,7 @@ class PendingAction:
     action: AgentAction
     reason: str
     created_at: datetime
+    snapshots: tuple[FileSnapshot, ...] = ()
 
 
 class TelegramAIBot:
@@ -135,7 +136,7 @@ class TelegramAIBot:
             return
 
         await update.message.reply_text(f"Approved {action_id}. Running now...")
-        await self._execute_action(update, pending.action)
+        await self._execute_action(update, pending.action, pending.snapshots)
 
     async def deny(self, update, context) -> None:
         if not await self._guard(update):
@@ -169,6 +170,24 @@ class TelegramAIBot:
 
         decision = self.safety.check_action(action.action, action.command)
         if decision.requires_approval:
+            snapshots: tuple[FileSnapshot, ...] = ()
+            preview_text = ""
+            if action.action == "code_write":
+                preview = preview_file_writes(
+                    action.files,
+                    self.config.workspace_root,
+                    self.config.allow_outside_workspace,
+                    self.shell.ctx.cwd,
+                    max_chars=max(800, min(3_000, self.config.command_output_limit - 700)),
+                )
+                if not preview.success:
+                    await update.message.reply_text(
+                        "The proposed file change cannot be safely reviewed:\n\n"
+                        + self._trim(preview.output)
+                    )
+                    return
+                snapshots = preview.snapshots
+                preview_text = f"\nDiff:\n{preview.output}\n"
             action_id = uuid.uuid4().hex[:8]
             self.pending[action_id] = PendingAction(
                 id=action_id,
@@ -176,19 +195,26 @@ class TelegramAIBot:
                 action=action,
                 reason=decision.reason,
                 created_at=datetime.now(),
+                snapshots=snapshots,
             )
             await update.message.reply_text(
                 "Approval needed.\n"
                 f"ID: {action_id}\n"
                 f"Reason: {decision.reason}\n"
                 f"Action: {self._describe_action(action)}\n"
+                f"{preview_text}"
                 f"Run /approve {action_id} or /deny {action_id}"
             )
             return
 
         await self._execute_action(update, action)
 
-    async def _execute_action(self, update, action: AgentAction) -> None:
+    async def _execute_action(
+        self,
+        update,
+        action: AgentAction,
+        expected_snapshots: tuple[FileSnapshot, ...] | None = None,
+    ) -> None:
         if action.action == "shell":
             await self._execute_shell(update, action.command)
             return
@@ -206,6 +232,7 @@ class TelegramAIBot:
                 self.config.workspace_root,
                 self.config.allow_outside_workspace,
                 self.shell.ctx.cwd,
+                expected_snapshots,
             )
             await update.message.reply_text(self._trim(result.output))
             return

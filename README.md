@@ -31,7 +31,7 @@ It is not trying to hide the shell behind a chatbot. RiftShell keeps commands, o
 | **AI workspace understanding** | Orbit can inspect relevant files and project structure, then explain them in professional English. |
 | **Smart execution** | Read-only and low-impact actions flow naturally; destructive or external actions require approval. |
 | **Reviewed code changes** | AI-generated edits appear as a unified diff before anything is written. |
-| **Automatic backups** | Approved replacements back up existing files under `.ai_backups/`. |
+| **Atomic reviewed writes** | Approved replacements are staged, backed up under `.ai_backups/`, and rolled back together if any write fails. |
 | **Local-first operation** | The shell and execution engine run on your machine, with optional fully local AI through Ollama. |
 | **Provider choice** | Use Gemini, Groq, Ollama, or an ordered fallback configuration. |
 | **Extensible command system** | Add commands through plugins without rewriting the shell core. |
@@ -97,7 +97,7 @@ Orbit can inspect a specific file or a bounded selection of relevant project fil
 - binary files
 - `.git`, virtual environments, dependency folders, build output, and AI backup folders
 
-Inspected file content is treated as untrusted data, not as instructions. When Orbit proposes a change, the desktop app shows a unified diff and waits for one explicit approval. Existing files are backed up before the approved content is applied.
+Inspected file content is treated as untrusted data, not as instructions. When Orbit proposes a change, the desktop app shows a complete bounded unified diff and waits for one explicit approval. Approval is tied to the exact file state that was reviewed, so an intervening developer edit blocks the write and requires a fresh diff. Approved files are staged before commit, existing files are backed up, and a multi-file failure rolls back changes already applied.
 
 > [!IMPORTANT]
 > Smart approvals and workspace restrictions reduce accidental actions, but RiftShell is not a full operating-system sandbox. Review code changes and high-impact commands before approving them.
@@ -351,7 +351,7 @@ Compile-check the Python modules:
 py -m compileall -q ai core ui commands plugins tests
 ```
 
-Current coverage includes AI provider selection, response envelopes, smart approvals, chained-command protection, workspace inspection, sensitive-file filtering, diff previews, file backups, and inspect-to-edit agent behavior.
+Current coverage includes AI provider selection, response envelopes, smart approvals, chained-command protection, workspace inspection, sensitive-file filtering, complete diff previews, stale-review protection, transactional rollback, file backups, and inspect-to-edit agent behavior.
 
 ## Roadmap
 

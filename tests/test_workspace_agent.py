@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from ai.code_writer import apply_file_writes, preview_file_writes
 from ai.llm import AgentPlanner
 from ai.workspace_reader import inspect_workspace_paths
 from core.shell import Shell
+from ui.main_window import pending_action_reply
 
 
 class CapturingGemini:
@@ -19,6 +21,17 @@ class CapturingGemini:
     def generate_content(self, prompt):
         self.prompts.append(prompt)
         return SimpleNamespace(text=json.dumps(self.payload))
+
+
+class SequencedGemini:
+    def __init__(self, *payloads):
+        self.payloads = list(payloads)
+        self.prompts = []
+
+    def generate_content(self, prompt):
+        self.prompts.append(prompt)
+        payload = self.payloads.pop(0)
+        return SimpleNamespace(text=json.dumps(payload))
 
 
 def make_config(workspace_root: Path):
@@ -123,6 +136,66 @@ class WorkspaceInspectionTests(unittest.TestCase):
             self.assertEqual(action.files, [FileWrite(path="app.py", content="print('fixed')\n")])
             self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "print('old')\n")
 
+    def test_hinglish_write_request_routes_to_the_named_file(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            (root / "app.py").write_text("", encoding="utf-8")
+            planner, _ = make_planner(
+                root,
+                {
+                    "action": "code_write",
+                    "message": "I prepared app.py.",
+                    "files": [{"path": "app.py", "content": "print('saved')\n"}],
+                },
+            )
+
+            action = planner.plan("app.py ke andar code likho jo saved print kare")
+
+            self.assertEqual(action.action, "code_write")
+            self.assertEqual(action.files[0].path, "app.py")
+
+    def test_chat_code_response_is_retried_as_an_actual_file_write(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            (root / "app.py").write_text("", encoding="utf-8")
+            planner, _ = make_planner(root, {"action": "respond", "message": "unused"})
+            model = SequencedGemini(
+                {"action": "respond", "message": "```python\nprint('only chat')\n```"},
+                {
+                    "action": "code_write",
+                    "message": "I prepared the actual file change.",
+                    "files": [{"path": "app.py", "content": "print('saved')\n"}],
+                },
+            )
+            planner._gemini = model
+
+            action = planner.plan("app.py ke andar code likho")
+
+            self.assertEqual(action.action, "code_write")
+            self.assertEqual(action.files[0].content, "print('saved')\n")
+            self.assertEqual(len(model.prompts), 2)
+            self.assertIn("Do not put source code in a chat response", model.prompts[1])
+
+    def test_write_to_an_unrequested_model_path_is_blocked(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            (root / "app.py").write_text("", encoding="utf-8")
+            planner, _ = make_planner(
+                root,
+                {
+                    "action": "code_write",
+                    "message": "Writing elsewhere.",
+                    "files": [{"path": "other.py", "content": "print('wrong')\n"}],
+                },
+            )
+
+            action = planner.plan("app.py ke andar code likho")
+
+            self.assertEqual(action.action, "respond")
+            self.assertIn("file you did not request", action.message)
+            self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "")
+            self.assertFalse((root / "other.py").exists())
+
     def test_sensitive_files_are_not_sent_to_the_model(self):
         with workspace_temp() as temp:
             root = Path(temp)
@@ -158,6 +231,23 @@ class WorkspaceInspectionTests(unittest.TestCase):
 
 
 class FileWriteReviewTests(unittest.TestCase):
+    def test_apply_requires_a_reviewed_snapshot(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            target = root / "app.py"
+            target.write_text("developer code\n", encoding="utf-8")
+
+            result = apply_file_writes(
+                [FileWrite(path="app.py", content="unreviewed change\n")],
+                root,
+                False,
+                root,
+            )
+
+            self.assertFalse(result.success)
+            self.assertIn("Blocked unreviewed AI change", result.output)
+            self.assertEqual(target.read_text(encoding="utf-8"), "developer code\n")
+
     def test_preview_is_non_mutating_and_apply_creates_backup(self):
         with workspace_temp() as temp:
             root = Path(temp)
@@ -172,13 +262,88 @@ class FileWriteReviewTests(unittest.TestCase):
             self.assertIn("+print('new')", preview.output)
             self.assertEqual(target.read_text(encoding="utf-8"), "print('old')\n")
 
-            result = apply_file_writes(files, root, False, root)
+            result = apply_file_writes(
+                files, root, False, root, expected_snapshots=preview.snapshots
+            )
 
             self.assertTrue(result.success)
             self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
             backups = list((root / ".ai_backups").rglob("app.py"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "print('old')\n")
+
+    def test_apply_blocks_when_file_changed_after_preview(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            target = root / "app.py"
+            target.write_text("reviewed\n", encoding="utf-8")
+            files = [FileWrite(path="app.py", content="orbit change\n")]
+            preview = preview_file_writes(files, root, False, root)
+
+            target.write_text("developer change\n", encoding="utf-8")
+            result = apply_file_writes(
+                files, root, False, root, expected_snapshots=preview.snapshots
+            )
+
+            self.assertFalse(result.success)
+            self.assertIn("changed after the diff was shown", result.output)
+            self.assertEqual(target.read_text(encoding="utf-8"), "developer change\n")
+            self.assertFalse((root / ".ai_backups").exists())
+
+    def test_multi_file_failure_rolls_back_all_applied_targets(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            first = root / "first.py"
+            second = root / "second.py"
+            first.write_text("first old\n", encoding="utf-8")
+            second.write_text("second old\n", encoding="utf-8")
+            files = [
+                FileWrite(path="first.py", content="first new\n"),
+                FileWrite(path="second.py", content="second new\n"),
+            ]
+            preview = preview_file_writes(files, root, False, root)
+
+            from ai import code_writer
+
+            real_replace = code_writer.os.replace
+            calls = 0
+
+            def fail_second_replace(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated replace failure")
+                return real_replace(source, target)
+
+            with patch("ai.code_writer.os.replace", side_effect=fail_second_replace):
+                result = apply_file_writes(
+                    files, root, False, root, expected_snapshots=preview.snapshots
+                )
+
+            self.assertFalse(result.success)
+            self.assertIn("rolled back", result.output)
+            self.assertEqual(first.read_text(encoding="utf-8"), "first old\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second old\n")
+            self.assertFalse(list(root.glob(".*.orbit-*.tmp")))
+            self.assertFalse(list(root.glob(".*.rollback-*.tmp")))
+
+    def test_incomplete_diff_is_not_approvable(self):
+        with workspace_temp() as temp:
+            root = Path(temp)
+            target = root / "large.txt"
+            target.write_text("old\n", encoding="utf-8")
+
+            preview = preview_file_writes(
+                [FileWrite(path="large.txt", content="new line\n" * 100)],
+                root,
+                False,
+                root,
+                max_chars=80,
+            )
+
+            self.assertFalse(preview.success)
+            self.assertFalse(preview.snapshots)
+            self.assertIn("No approval is available for a partial diff", preview.output)
 
     def test_inspect_action_payload_keeps_paths_and_objective(self):
         action = AgentAction.from_payload({
@@ -190,6 +355,24 @@ class FileWriteReviewTests(unittest.TestCase):
         self.assertEqual(action.action, "inspect")
         self.assertEqual(action.paths, ["README.md", "ai/llm.py"])
         self.assertEqual(action.objective, "Explain the architecture")
+
+
+class PendingApprovalReplyTests(unittest.TestCase):
+    def test_typed_confirmation_approves_the_reviewed_change(self):
+        self.assertEqual(
+            pending_action_reply("okay write this code inside index.html"),
+            "approve",
+        )
+        self.assertEqual(pending_action_reply("haan, apply kar do"), "approve")
+        self.assertEqual(pending_action_reply("Approve"), "approve")
+
+    def test_typed_rejection_dismisses_the_reviewed_change(self):
+        self.assertEqual(pending_action_reply("nahi, mat likho"), "reject")
+        self.assertEqual(pending_action_reply("cancel it"), "reject")
+
+    def test_follow_up_edit_is_not_mistaken_for_approval(self):
+        self.assertIsNone(pending_action_reply("okay but change the title first"))
+        self.assertIsNone(pending_action_reply("make the heading blue"))
 
 
 if __name__ == "__main__":
