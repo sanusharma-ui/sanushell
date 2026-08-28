@@ -224,6 +224,8 @@ class AssistantLanguageTests(unittest.TestCase):
         self.assertIn("English-only workspace assistant", prompt)
         self.assertIn("Always respond in professional English", prompt)
         self.assertIn("regardless of the language used by the user", prompt)
+        self.assertIn("JSON-escape this field exactly once", prompt)
+        self.assertIn("\"content\":\"print('hello')\\n\"", prompt)
 
 
 if __name__ == "__main__":

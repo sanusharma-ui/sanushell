@@ -231,6 +231,46 @@ class WorkspaceInspectionTests(unittest.TestCase):
 
 
 class FileWriteReviewTests(unittest.TestCase):
+    def test_double_escaped_document_content_is_restored_before_preview(self):
+        escaped_html = (
+            r'<!DOCTYPE html>\n<html lang=\"en\">\n<body>\n'
+            r'<h1 class=\"title\">Hello</h1>\n</body>\n</html>\n'
+        )
+
+        action = AgentAction.from_payload({
+            "action": "code_write",
+            "files": [{"path": "index.html", "content": escaped_html}],
+        })
+
+        self.assertEqual(
+            action.files[0].content,
+            '<!DOCTYPE html>\n<html lang="en">\n<body>\n'
+            '<h1 class="title">Hello</h1>\n</body>\n</html>\n',
+        )
+
+    def test_intentional_string_newline_escapes_are_preserved(self):
+        javascript = r'const message = "first\nsecond\nthird";'
+
+        action = AgentAction.from_payload({
+            "action": "code_write",
+            "files": [{"path": "app.js", "content": javascript}],
+        })
+
+        self.assertEqual(action.files[0].content, javascript)
+
+    def test_double_escaped_python_without_double_quotes_is_restored(self):
+        escaped_python = r"def greet():\n    print('hello')\n\ngreet()\n"
+
+        action = AgentAction.from_payload({
+            "action": "code_write",
+            "files": [{"path": "hello.py", "content": escaped_python}],
+        })
+
+        self.assertEqual(
+            action.files[0].content,
+            "def greet():\n    print('hello')\n\ngreet()\n",
+        )
+
     def test_apply_requires_a_reviewed_snapshot(self):
         with workspace_temp() as temp:
             root = Path(temp)
